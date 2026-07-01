@@ -11,8 +11,12 @@ __pycache__/
 # Data & generated outputs
 data/
 
-# Source PDFs (large binary files)
+# Source PDFs (large binary files) — personal / copyrighted material, never push
 raw/*.pdf
+inbox/
+
+# IDE
+.idea/
 
 # OS
 .DS_Store

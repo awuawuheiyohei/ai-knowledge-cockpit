@@ -1,255 +1,310 @@
-#!/usr/bin/env python3
 """
-AI Knowledge Cockpit — CLI entry point.
+app.py — CLI entry point for the AI Knowledge Cockpit (v2).
 
-Study tools: summary, quiz, wrong-question tracking, daily plans.
+Design philosophy
+-----------------
+- One command per verb. No flags hidden inside subcommands.
+- All output is plain text — friendly to terminals, logs, and future IM bridges.
+- No LLM calls anywhere. This is a retrieval tool, not a chatbot.
 
-Put your Markdown notes in notes/ and use the commands below.
+Commands
+--------
+  ingest  <path> [--recursive]   add PDF/MD files into the KB
+  list                           show all ingested sources
+  search <query> [--top N] [--doc NAME]
+                                 keyword search over the KB
+  remove <filename|id>           remove a source from the KB
+  rebuild                        rebuild the BM25 index from scratch
+  status                         show KB statistics
+  serve wecom                    start WeCom (Enterprise WeChat) callback server
+  serve dingtalk                 start DingTalk Stream-mode bot
 """
+from __future__ import annotations
 
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from string import Template
 
-from dotenv import load_dotenv
-
-from prompts import (
-    SUMMARY_PROMPT, QUIZ_PROMPT, WRONG_ANALYSIS_PROMPT, PLAN_PROMPT, REFINE_PROMPT,
-)
-from llm_client import LLMClient
-from knowledge import (
-    chunk_text, list_notes, load_input_file, load_note, save_note, save_note_file,
-    save_output, save_json,
-)
-from review import add_wrong_question, load_wrong_questions, load_progress
-
-# Load .env on startup
-load_dotenv()
-
-# Template-based prompts (safe from format-string injection)
-_SUMMARY_T = Template(SUMMARY_PROMPT)
-_QUIZ_T = Template(QUIZ_PROMPT)
-_WRONG_T = Template(WRONG_ANALYSIS_PROMPT)
-_PLAN_T = Template(PLAN_PROMPT)
-_REFINE_T = Template(REFINE_PROMPT)
+import config
+import paths
+import storage
+import bm25
+import ingest
+import search as search_mod
 
 
-# ── helpers ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
 
-def _extract_json(text):
-    """Extract JSON array from LLM response, with robust fallbacks."""
-    import re as _re
+def cmd_init(args) -> int:
+    """Make sure the DB exists and dirs are present. Always safe to re-run."""
+    paths.ensure_dirs()
+    storage.init_db()
+    print(f"KB ready at {paths.DB_PATH}")
+    return 0
 
-    text = text.strip()
-    # Strip common fence styles
-    text = _re.sub(r'^```(?:json)?\s*\n?', '', text)
-    text = _re.sub(r'\n?```\s*$', '', text)
-    text = _re.sub(r'^~~~\s*\n?', '', text)
-    text = _re.sub(r'\n?~~~\s*$', '', text)
 
-    match = _re.search(r'\[.*\]', text, _re.DOTALL)
-    if not match:
-        raise ValueError(
-            f'No JSON array found in LLM response. First 200 chars: {text[:200]}'
+def cmd_ingest(args) -> int:
+    paths.ensure_dirs()
+    storage.init_db()
+    summaries = ingest.ingest_path(
+        args.path,
+        recursive=args.recursive,
+        use_ocr=args.ocr,
+    )
+    ingest.print_summaries(summaries)
+    failures = [s for s in summaries if s.status == "failed"]
+    return 1 if failures else 0
+
+
+def cmd_list(args) -> int:
+    storage.init_db()
+    docs = storage.list_documents()
+    if not docs:
+        print("(no documents ingested yet)")
+        return 0
+    print(f"{'ID':>4}  {'STATUS':<8}  {'TYPE':<8}  {'PAGES':>5}  {'CHUNKS':>6}  {'CHARS':>7}  FILENAME")
+    for d in docs:
+        pages = d["page_count"] if d["page_count"] is not None else "-"
+        print(
+            f"{d['id']:>4}  {d['status']:<8}  {d['source_type']:<8}  "
+            f"{pages!s:>5}  {d['chunk_count']:>6}  {d['char_count']:>7}  {d['filename']}"
         )
+    return 0
+
+
+def cmd_search(args) -> int:
+    storage.init_db()
+    if not storage.list_documents():
+        print("(no documents ingested yet — run `ingest` first)")
+        return 1
+    hits = search_mod.search(args.query, top_k=args.top, filename=args.doc)
+    search_mod.render(hits)
+    return 0
+
+
+def cmd_remove(args) -> int:
+    storage.init_db()
+    target = args.target
+
+    # Try as id first if it looks numeric.
+    doc = None
+    if target.isdigit():
+        doc = storage.get_document(int(target))
+    if doc is None:
+        doc = storage.get_document_by_name(target)
+
+    if doc is None:
+        print(f"No document matched: {target}")
+        return 1
+
+    storage.delete_document(doc["id"])
+    print(f"Removed: {doc['filename']} (id={doc['id']})")
+    return 0
+
+
+def cmd_rebuild(args) -> int:
+    """
+    Wipe the index tables and rebuild from the chunks table.
+
+    Use this if index stats get out of sync (rare, but possible if you
+    poke the DB directly). Chunks and documents are preserved.
+    """
+    storage.init_db()
+    conn = storage.get_conn()
     try:
-        return json.loads(match.group())
-    except json.JSONDecodeError as e:
-        raise ValueError(f'Invalid JSON in LLM response: {e}\nRaw: {match.group()[:300]}')
+        n = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        if n == 0:
+            print("(no documents — nothing to rebuild)")
+            return 0
+        conn.execute("DELETE FROM index_term")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Re-index every document.
+    docs = storage.list_documents()
+    rebuilt = 0
+    for d in docs:
+        texts = storage.get_chunk_texts(d["id"])
+        if texts:
+            bm25.index_document(d["id"], texts)
+            rebuilt += 1
+    print(f"Rebuilt index for {rebuilt}/{len(docs)} document(s).")
+    return 0
 
 
-# ── study commands ──────────────────────────────────────────────────
+def cmd_status(args) -> int:
+    storage.init_db()
+    docs = storage.list_documents()
+    stats = storage.corpus_stats()
+    n_total = len(docs)
+    n_ok = sum(1 for d in docs if d["status"] == "ok")
+    n_partial = sum(1 for d in docs if d["status"] == "partial")
+    n_failed = sum(1 for d in docs if d["status"] == "failed")
+    n_pdf = sum(1 for d in docs if d["source_type"] == "pdf")
+    n_md = sum(1 for d in docs if d["source_type"] == "markdown")
 
-def cmd_list_notes(_args):
-    notes = list_notes()
-    if not notes:
-        print('No notes found in notes/. Add markdown files first.')
-        return
-    for n in notes:
-        print(n)
+    # Documents with scan-page warnings.
+    scan_warnings: list[tuple[str, list[int]]] = []
+    ocr_totals = {"docs": 0, "pages": 0}
+    for d in docs:
+        if d.get("scan_pages"):
+            try:
+                sp = json.loads(d["scan_pages"])
+            except (TypeError, ValueError):
+                sp = []
+            if sp:
+                scan_warnings.append((d["filename"], sp))
+        if d.get("ocr_pages"):
+            try:
+                op = json.loads(d["ocr_pages"])
+            except (TypeError, ValueError):
+                op = []
+            if op:
+                ocr_totals["docs"] += 1
+                ocr_totals["pages"] += len(op)
 
-
-def cmd_summary(args):
-    note = load_note(args.note)
-    client = LLMClient()
-    result = client.chat(_SUMMARY_T.substitute(note=note))
-    p = save_output('latest_summary.md', result)
-    print(f'Saved summary to {p}')
-    print(result)
-
-
-def cmd_quiz(args):
-    note = load_note(args.note)
-    client = LLMClient()
-    raw = client.chat(_QUIZ_T.substitute(note=note, count=args.count), temperature=0.4)
-    questions = _extract_json(raw)
-    p = save_json('latest_quiz.json', questions)
-    print(f'Saved quiz to {p}')
-    print(json.dumps(questions, ensure_ascii=False, indent=2))
-
-
-def cmd_add_wrong(args):
-    record = {
-        'question': args.question,
-        'my_answer': args.my_answer,
-        'correct_answer': args.correct_answer,
-        'explanation': args.explanation,
-        'topic': args.topic,
-    }
-    p = add_wrong_question(record)
-    print(f'Saved wrong question to {p}')
-
-
-def cmd_analyze_wrong(args):
-    client = LLMClient()
-
-    if args.id is not None:
-        # Look up by index in wrong_questions.json
-        wrongs = load_wrong_questions()
-        if args.id < 0 or args.id >= len(wrongs):
-            print(f'Error: id {args.id} out of range (0–{len(wrongs)-1})', file=sys.stderr)
-            sys.exit(1)
-        record = wrongs[args.id]
-        question = record['question']
-        my_answer = record['my_answer']
-        correct_answer = record['correct_answer']
-        explanation = record['explanation']
+    print(f"DB path        : {paths.DB_PATH}")
+    print(f"Documents      : {n_total}  (ok={n_ok}, partial={n_partial}, failed={n_failed})")
+    print(f"  - PDFs       : {n_pdf}")
+    print(f"  - Markdown   : {n_md}")
+    print(f"Chunks         : {stats['n_chunks']}")
+    print(f"Avg chunk len  : {stats['avg_chunk_len']:.1f} chars")
+    print(f"Chunk size cfg : {config.CHUNK_SIZE} chars  (overlap {config.CHUNK_OVERLAP})")
+    if scan_warnings:
+        print("Scan warnings  :")
+        for fn, pages in scan_warnings:
+            print(f"  - {fn}: pages {pages}")
     else:
-        question = args.question
-        my_answer = args.my_answer
-        correct_answer = args.correct_answer
-        explanation = args.explanation
-
-    result = client.chat(_WRONG_T.substitute(
-        question=question,
-        my_answer=my_answer,
-        correct_answer=correct_answer,
-        explanation=explanation,
-    ))
-    p = save_output('latest_wrong_analysis.md', result)
-    print(f'Saved analysis to {p}')
-    print(result)
-
-
-def cmd_refine_note(args):
-    """Refine raw text into structured notes via REFINE_PROMPT (chunked LLM calls)."""
-    raw = load_input_file(args.input)
-    chunks = chunk_text(raw, args.chunk_size)
-    if not chunks:
-        print('Error: input file is empty', file=sys.stderr)
-        sys.exit(1)
-
-    client = LLMClient()
-    refined_parts = []
-    total = len(chunks)
-
-    for i, chunk in enumerate(chunks, 1):
-        print(f'Refining section {i}/{total}...', file=sys.stderr)
-        result = client.chat(
-            _REFINE_T.substitute(index=i, total=total, chunk=chunk),
-            temperature=0.2,
+        print("Scan warnings  : none")
+    if ocr_totals["pages"]:
+        print(
+            f"OCR'd          : {ocr_totals['pages']} pages across {ocr_totals['docs']} docs"
         )
-        refined_parts.append(f'<!-- Refined section {i}/{total} -->\n\n{result.strip()}')
-
-    topic = args.topic or Path(args.input).stem
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    source = str(Path(args.input).resolve())
-    body = '\n\n'.join(refined_parts)
-    content = (
-        f'---\n'
-        f'source: {source}\n'
-        f'refined_at: {now}\n'
-        f'chunks: {total}\n'
-        f'---\n\n'
-        f'# {topic}\n\n'
-        f'{body}\n'
-    )
-
-    if args.subject:
-        p = save_note(args.subject, topic, content)
     else:
-        filename = topic if topic.endswith('.md') else f'{topic}.md'
-        p = save_note_file(filename, content)
-
-    print(f'Saved refined note to {p} ({total} chunk(s))')
+        print("OCR'd          : 0 pages (use `ingest --ocr` to OCR scanned PDFs)")
+    return 0
 
 
-def cmd_plan(_args):
-    mistakes = load_wrong_questions()
-    progress = load_progress()
-    client = LLMClient()
-    result = client.chat(_PLAN_T.substitute(
-        mistakes=json.dumps(mistakes, ensure_ascii=False, indent=2),
-        progress=json.dumps(progress, ensure_ascii=False, indent=2),
-    ))
-    p = save_output('today_plan.md', result)
-    print(f'Saved plan to {p}')
-    print(result)
+# ---------------------------------------------------------------------------
+# IM server commands
+# ---------------------------------------------------------------------------
+
+def cmd_serve_wecom(args) -> int:
+    """
+    Start the WeCom (Enterprise WeChat) bot callback server.
+
+    Reads config from environment (see im_config.load_wecom_config).
+    Reaches a public URL via either:
+      - your own reverse proxy / public server
+      - a tunnel like ngrok (recommended for local dev)
+    """
+    try:
+        from wecom_server import main as wecom_main
+    except ImportError as e:
+        print(f"wecom_server not available: {e}", file=sys.stderr)
+        return 2
+    try:
+        wecom_main()
+        return 0
+    except ValueError as e:
+        print(f"WeCom config error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 0
 
 
-# ── argument parser ────────────────────────────────────────────────
+def cmd_serve_dingtalk(args) -> int:
+    """
+    Start the DingTalk Stream-mode bot.
 
-def build_parser():
-    parser = argparse.ArgumentParser(description='AI Knowledge Cockpit')
-    sub = parser.add_subparsers(dest='command', required=True)
+    No public callback URL needed — DingTalk opens a WebSocket to us.
+    """
+    try:
+        from dingtalk_server import run as dt_run
+    except ImportError as e:
+        print(f"dingtalk_server not available: {e}", file=sys.stderr)
+        return 2
+    try:
+        dt_run()
+        return 0
+    except ValueError as e:
+        print(f"DingTalk config error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 0
 
-    sp = sub.add_parser('list-notes')
-    sp.set_defaults(func=cmd_list_notes)
 
-    sp = sub.add_parser('summary')
-    sp.add_argument('--note', required=True, help='Path to markdown note')
-    sp.set_defaults(func=cmd_summary)
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 
-    sp = sub.add_parser('quiz')
-    sp.add_argument('--note', required=True, help='Path to markdown note')
-    sp.add_argument('--count', type=int, default=5)
-    sp.set_defaults(func=cmd_quiz)
-
-    sp = sub.add_parser('add-wrong')
-    sp.add_argument('--question', required=True)
-    sp.add_argument('--my-answer', required=True)
-    sp.add_argument('--correct-answer', required=True)
-    sp.add_argument('--explanation', required=True)
-    sp.add_argument('--topic', default='general')
-    sp.set_defaults(func=cmd_add_wrong)
-
-    sp = sub.add_parser('analyze-wrong')
-    sp.add_argument('--id', type=int, default=None, help='Index in wrong_questions.json')
-    sp.add_argument('--question', default=None)
-    sp.add_argument('--my-answer', default=None)
-    sp.add_argument('--correct-answer', default=None)
-    sp.add_argument('--explanation', default=None)
-    sp.set_defaults(func=cmd_analyze_wrong)
-
-    sp = sub.add_parser('plan')
-    sp.set_defaults(func=cmd_plan)
-
-    sp = sub.add_parser(
-        'refine-note',
-        help='Refine raw text into structured notes/ Markdown via LLM',
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="app.py",
+        description="AI Knowledge Cockpit — local, retrieval-only, no LLM.",
     )
-    sp.add_argument('--input', required=True, help='Path to raw text/markdown file')
-    sp.add_argument('--topic', default=None, help='Note title (defaults to input filename)')
-    sp.add_argument(
-        '--subject',
-        default=None,
-        help='Optional subfolder under notes/ (e.g. cissp). Omit to save flat in notes/',
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init", help="initialize DB and folders")
+    p_init.set_defaults(func=cmd_init)
+
+    p_ingest = sub.add_parser("ingest", help="ingest a file or directory")
+    p_ingest.add_argument("path", help="PDF file, MD file, or directory")
+    p_ingest.add_argument(
+        "-r", "--recursive", action="store_true", help="recurse into subdirectories"
     )
-    sp.add_argument(
-        '--chunk-size',
-        type=int,
-        default=6000,
-        help='Max characters per LLM chunk (default: 6000)',
+    p_ingest.add_argument(
+        "--ocr",
+        action="store_true",
+        help="OCR scanned pages via VL API (requires VL_API_KEY; uses token)",
     )
-    sp.set_defaults(func=cmd_refine_note)
+    p_ingest.set_defaults(func=cmd_ingest)
 
-    return parser
+    p_list = sub.add_parser("list", help="list ingested documents")
+    p_list.set_defaults(func=cmd_list)
+
+    p_search = sub.add_parser("search", help="BM25 search")
+    p_search.add_argument("query", help="search query string")
+    p_search.add_argument("--top", type=int, default=config.DEFAULT_TOP_K,
+                          help=f"number of hits (default {config.DEFAULT_TOP_K}, max {config.MAX_TOP_K})")
+    p_search.add_argument("--doc", default=None,
+                          help="restrict to a single source filename")
+    p_search.set_defaults(func=cmd_search)
+
+    p_remove = sub.add_parser("remove", help="remove a document by id or filename")
+    p_remove.add_argument("target", help="document id or exact filename")
+    p_remove.set_defaults(func=cmd_remove)
+
+    p_rebuild = sub.add_parser("rebuild", help="rebuild the BM25 index from chunks")
+    p_rebuild.set_defaults(func=cmd_rebuild)
+
+    p_status = sub.add_parser("status", help="show KB statistics")
+    p_status.set_defaults(func=cmd_status)
+
+    p_serve = sub.add_parser("serve", help="start an IM bridge")
+    serve_sub = p_serve.add_subparsers(dest="platform", required=True)
+    p_serve_wecom = serve_sub.add_parser(
+        "wecom",
+        help="start the Enterprise WeChat (WeCom) callback server (HTTP, needs public URL)",
+    )
+    p_serve_wecom.set_defaults(func=cmd_serve_wecom)
+    p_serve_dt = serve_sub.add_parser(
+        "dingtalk",
+        help="start the DingTalk Stream-mode bot (WebSocket, no public URL needed)",
+    )
+    p_serve_dt.set_defaults(func=cmd_serve_dingtalk)
+
+    return p
 
 
-if __name__ == '__main__':
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    args.func(args)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

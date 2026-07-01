@@ -1,1 +1,5 @@
-python-dotenv>=1.0.0
+pymupdf>=1.24
+flask>=3.0
+pycryptodome>=3.20
+dingtalk-stream>=0.24
+anthropic>=0.40
