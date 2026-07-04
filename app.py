@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 import config
@@ -31,6 +32,59 @@ import storage
 import bm25
 import ingest
 import search as search_mod
+
+
+# ---------------------------------------------------------------------------
+# CISSP CBK domain classification (for `status` coverage report)
+# ---------------------------------------------------------------------------
+# The 8 domains of (ISC)² CISSP Common Body of Knowledge. Used only for
+# rendering the `status` coverage map — does not affect retrieval.
+
+CISSP_DOMAINS: list[tuple[int, str]] = [
+    (1, "安全与风险管理"),
+    (2, "资产安全"),
+    (3, "安全架构与工程"),
+    (4, "通信与网络安全"),
+    (5, "身份与访问管理"),
+    (6, "安全评估与测试"),
+    (7, "安全运营"),
+    (8, "软件开发安全"),
+]
+
+# OSG chapter -> CBK domain. From the (ISC)² official CBK domain weighting.
+# Source mapping: chapters 1-4 -> D1, ch5 -> D2, ch6-10 -> D3, ch11-12 -> D4,
+# ch13-14 -> D5, ch15 -> D6, ch16-19 -> D7, ch20-21 -> D8.
+CHAPTER_TO_DOMAIN: dict[int, int] = {
+    1: 1, 2: 1, 3: 1, 4: 1,
+    5: 2,
+    6: 3, 7: 3, 8: 3, 9: 3, 10: 3,
+    11: 4, 12: 4,
+    13: 5, 14: 5,
+    15: 6,
+    16: 7, 17: 7, 18: 7, 19: 7,
+    20: 8, 21: 8,
+}
+
+
+def classify_cissp_domain(filename: str) -> int | None:
+    """
+    Map a document filename to a CISSP CBK domain (1-8) if possible.
+
+    Recognized patterns:
+      - "域N：..."  -> N  (the per-domain PDFs)
+      - "第N章-..." -> domain via CHAPTER_TO_DOMAIN
+
+    Returns None for general references (OSG9/10), 综合测试, mocks, etc.
+    """
+    m = re.match(r"^域(\d+)", filename)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 8:
+            return n
+    m = re.match(r"^第(\d+)章", filename)
+    if m:
+        return CHAPTER_TO_DOMAIN.get(int(m.group(1)))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +239,43 @@ def cmd_status(args) -> int:
         )
     else:
         print("OCR'd          : 0 pages (use `ingest --ocr` to OCR scanned PDFs)")
+
+    # CISSP CBK 8-domain coverage map.
+    classified: dict[int, int] = {n: 0 for n, _ in CISSP_DOMAINS}
+    unclassified_chunks = 0
+    failed_in_classified = 0
+    for d in docs:
+        domain = classify_cissp_domain(d["filename"])
+        if domain is not None:
+            classified[domain] += d["chunk_count"]
+            if d["status"] == "failed":
+                failed_in_classified += 1
+        else:
+            unclassified_chunks += d["chunk_count"]
+
+    print()
+    print("CISSP CBK domain coverage (8 domains):")
+    max_cls = max(classified.values()) if classified else 0
+    if max_cls == 0:
+        print("  (no per-domain docs yet — chapter PDFs/markdown drive this map)")
+    else:
+        for n, name in CISSP_DOMAINS:
+            cnt = classified[n]
+            bar_len = (20 * cnt) // max_cls if max_cls else 0
+            bar = "=" * bar_len + " " * (20 - bar_len)
+            pct = (100 * cnt // max_cls) if max_cls else 0
+            print(f"  域{n} {name:<10}  [{bar}] {cnt:>5} chunks  ({pct:>3}%)")
+        if unclassified_chunks:
+            print(
+                f"  (+ {unclassified_chunks} chunks in OSG9/10 general references — not per-domain classified)"
+            )
+        if failed_in_classified:
+            print(
+                f"  ! {failed_in_classified} classified doc(s) failed to extract — re-ingest with `--ocr` to fill coverage"
+            )
+    print(
+        "  Tip: search within a domain ->  search \"...\" --doc \"第13章-...pdf\""
+    )
     return 0
 
 

@@ -15,6 +15,9 @@ data/
 raw/*.pdf
 inbox/
 
+# Local logs (OCR runs etc.)
+logs/
+
 # IDE
 .idea/
 
