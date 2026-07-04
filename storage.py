@@ -17,6 +17,7 @@ Design notes
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -102,12 +103,44 @@ def tx(conn: sqlite3.Connection):
 
 
 def init_db() -> None:
-    """Create tables if they don't exist. Safe to call repeatedly."""
+    """Create tables if they don't exist. Safe to call repeatedly.
+
+    Also runs a small migration step: if any expected column is missing
+    (because the DB was created with an older schema), it gets added via
+    ALTER TABLE ADD COLUMN. SQLite has no real migration framework and
+    CREATE TABLE IF NOT EXISTS won't add new columns — so this is the
+    minimal way to keep older DBs forward-compatible with newer code.
+    """
     conn = get_conn()
     try:
         conn.executescript(_SCHEMA)
+        # Forward-compat migrations for columns added after the original schema.
+        _migrate_add_columns(conn)
     finally:
         conn.close()
+
+
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, declaration)
+    ("documents", "ocr_pages", "TEXT"),
+    ("chunks", "via_ocr", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing expected columns. Idempotent."""
+    for table, col, decl in _MIGRATIONS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                logging.getLogger("storage").info(
+                    "migration: added %s.%s (%s)", table, col, decl
+                )
+            except sqlite3.OperationalError as e:
+                # Column was added concurrently — fine.
+                if "duplicate column" not in str(e).lower():
+                    raise
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +254,7 @@ def list_documents() -> list[dict]:
         cur = conn.execute(
             """
             SELECT d.id, d.filename, d.source_type, d.relative_path, d.page_count,
-                   d.char_count, d.status, d.scan_pages, d.ingested_at,
+                   d.char_count, d.status, d.scan_pages, d.ocr_pages, d.ingested_at,
                    (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id) AS chunk_count
               FROM documents d
              ORDER BY d.ingested_at DESC, d.id DESC
