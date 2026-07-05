@@ -5,6 +5,24 @@
 
 ---
 
+## 0. 一行启动(懒人入口)
+
+> 不读手册也能上手。两个子命令搞定:
+
+```bash
+./quickstart.sh check      # 环境体检:venv / .env / IM 凭证 / KB 状态都给你看一眼
+./quickstart.sh serve      # init + ingest inbox/ + ingest notes/ + 起 DingTalk bot
+./quickstart.sh serve cli  # 不起 bot,跑完 ingest 后直接打印 status
+```
+
+规则(快速版):
+- `serve` 默认起 **DingTalk**(免公网,推荐)。想换 `./quickstart.sh serve wecom`。
+- **绝不自动 OCR** —— `--ocr` 才会调 VL API(花钱)。需要时:`./quickstart.sh serve --ocr dingtalk`。
+- **绝不自动改 `.env`** —— 凭证缺了就告诉你填哪个变量。
+- 想了解每一步在干嘛 → 继续往下读"1. 一次性启动"。
+
+---
+
 ## 1. 一次性启动(只需要做一次)
 
 ```bash

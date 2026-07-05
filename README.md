@@ -25,6 +25,15 @@ chat surface — terminal, WeCom, or DingTalk.
 
 ## Quickstart
 
+> 第一次上手?**一行命令**就够了:
+> ```bash
+> ./quickstart.sh check     # 看环境缺什么(venv / .env / IM 凭证)
+> ./quickstart.sh serve     # init + ingest inbox/ + ingest notes/ + 起 DingTalk bot
+> ```
+> 详细步骤和故障排查看 **[COMMANDS.md](COMMANDS.md)**。
+
+下面这套是"知道自己在干嘛"时的逐步版本:
+
 ```bash
 # 1. Initialize (creates db.sqlite, inbox/, data/originals/)
 python app.py init
