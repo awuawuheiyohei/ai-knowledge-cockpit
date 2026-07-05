@@ -32,6 +32,15 @@ chat surface — terminal, WeCom, or DingTalk.
 > ```
 > 详细步骤和故障排查看 **[COMMANDS.md](COMMANDS.md)**。
 
+### 常见场景(一行命令)
+
+| 你想干嘛 | 命令 |
+|---|---|
+| 只想本地跑跑,不上 IM | `./quickstart.sh serve cli` |
+| 起 DingTalk bot(推荐,免域名) | `./quickstart.sh serve dingtalk` |
+| 起企业微信 bot(需公网域名) | `./quickstart.sh serve wecom` |
+| 扫描版 PDF 一起 OCR 进去 | `./quickstart.sh serve --ocr dingtalk`(花 VL API 钱) |
+
 下面这套是"知道自己在干嘛"时的逐步版本:
 
 ```bash
