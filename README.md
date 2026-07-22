@@ -83,6 +83,42 @@ and **[OCR_SETUP.md](OCR_SETUP.md)** for scanned-PDF auto-OCR.
 | `serve dingtalk` | Start DingTalk Stream-mode bot |
 | `serve wecom` | Start WeCom callback server |
 
+## Operator scripts
+
+Three shell helpers in `scripts/` for the day-to-day loop. They wrap
+`app.py` so you don't have to remember the subcommand grammar.
+
+| Script | What it does |
+| --- | --- |
+| `scripts/add.sh <file-or-folder> [--ocr] [--demo]` | Copy into `inbox/`, run `app.py ingest`, print 5-line status. `--ocr` for scanned PDFs (costs VL tokens); `--demo` runs a top-3 search using the filename. |
+| `scripts/ask.sh "<query>" [--rewrite] [--top N] [--doc FILE]` | BM25 search. With `--rewrite`, the query first goes through `query_rewrite.rewrite()` so "用户能用什么密码登录" becomes keyword form before BM25 sees it. |
+| `scripts/rebuild.sh [--yes] [--dry-run]` | Wipe and rebuild the BM25 inverted index, showing chunk-count before/after. Use this after editing `config.py` or suspecting index drift. |
+
+All three:
+- Live in `scripts/` (pure bash, no Python package)
+- `set -euo pipefail`, pick `.venv/bin/python` first (fall back to system `python3`)
+- Use absolute paths only (a hook for the `mavis-trash` tool refuses to expand shell variables like `~` or `$HOME`)
+
+### When to use which
+
+| You want to… | Run this |
+| --- | --- |
+| Just downloaded a new PDF | `./scripts/add.sh ~/Downloads/new.pdf` |
+| Drop a whole folder of PDFs in | `./scripts/add.sh ~/Downloads/cissp_week5/ --recursive` |
+| Force OCR on a scanned PDF | `./scripts/add.sh inbox/scanned.pdf --ocr` |
+| Quick keyword search | `./scripts/ask.sh "PKI 数字证书" --top 5` |
+| Ask in plain Chinese | `./scripts/ask.sh "忘了那个认证的东西叫什么" --rewrite` |
+| I changed `config.py` and things look off | `./scripts/rebuild.sh --yes` |
+| Preview rebuild without doing it | `./scripts/rebuild.sh --dry-run` |
+
+### Adjacent tools (not in `scripts/`)
+
+| Path | Purpose |
+| --- | --- |
+| `quickstart.sh` (root) | `check` / `serve [dingtalk\|wecom\|cli]` — the day-one launcher. |
+| `start.sh` (root) | Internal launcher: loads `.env` then runs `app.py ...`. |
+| `tools/batch_ocr_inbox.sh` | Batch-OCR every failed PDF in `inbox/` (run `--dry-run` first; ~¥0.01-0.03/page). |
+
 ## Hard rules
 
 1. **No LLM.** Retrieval is BM25 over character bigrams (CJK) + Latin words.

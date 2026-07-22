@@ -62,6 +62,20 @@ python app.py serve wecom                         # start WeCom callback server
 
 ---
 
+# 🛠 Operator scripts
+
+Three bash helpers in `scripts/` wrap the CLI for the day-to-day loop.
+For full usage tables and "when to use which" cheatsheet, see
+**README.md → Operator scripts**. Quick reference:
+
+- `scripts/add.sh <path> [--ocr] [--demo]` — copy + ingest + status
+- `scripts/ask.sh "<query>" [--rewrite]` — search; `--rewrite` routes through `query_rewrite.rewrite()` first
+- `scripts/rebuild.sh [--yes] [--dry-run]` — wipe and rebuild the BM25 inverted index
+
+Adjacent tools (not in `scripts/`): `quickstart.sh` (root), `start.sh` (root), `tools/batch_ocr_inbox.sh`.
+
+---
+
 # 🚧 Hard Rules
 
 ### 🚫 No LLM in retrieval
