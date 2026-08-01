@@ -15,7 +15,8 @@ Stream mode requires:
   - No public callback URL needed; no nginx; no ngrok; no cert.
 
 This module subscribes to the ChatbotMessage topic and routes incoming
-text into `im_router.handle_message()`. Replies go back as Markdown.
+text AND images into `im_router.handle_message()` / `im_router.handle_image()`.
+Replies go back as Markdown.
 
 Reference: https://github.com/open-dingtalk/dingtalk-stream-sdk-python
 """
@@ -23,13 +24,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+import tempfile
 from typing import Optional
 
 import paths  # noqa: F401  — ensure dirs exist on import
 import storage
 from im_config import load_dingtalk_config
-from im_router import handle_message
+from im_router import handle_message, handle_image
 
 
 def setup_logger() -> logging.Logger:
@@ -48,6 +51,20 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
+def _send_markdown(handler_self, sdk_handler, incoming, reply: str) -> None:
+    """
+    Send `reply` as a Markdown message, falling back to text if the
+    Markdown send raises. Logs the failure either way.
+    """
+    try:
+        sdk_handler.reply_markdown("知识库检索", reply, incoming)
+    except Exception as e:  # pragma: no cover
+        handler_self._logger.warning(
+            "reply_markdown failed (%s); falling back to reply_text", e,
+        )
+        sdk_handler.reply_text(reply, incoming)
+
+
 def _extract_text(incoming) -> str:
     """
     Pull the user's text out of an incoming ChatbotMessage.
@@ -62,6 +79,38 @@ def _extract_text(incoming) -> str:
     except AttributeError:
         pass
     return ""
+
+
+def _detect_image_ext(data: bytes) -> str:
+    """Best-effort image format from magic bytes. Returns ".jpg" / ".png" / etc."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
+def _extract_image_download_code(incoming) -> Optional[str]:
+    """
+    Extract the image download_code from a DingTalk image ChatbotMessage.
+
+    The SDK's ChatbotMessage.image object has changed field names across
+    versions; we try the common ones defensively.
+    """
+    if getattr(incoming, "message_type", None) != "image":
+        return None
+    img = getattr(incoming, "image", None)
+    if img is None:
+        return None
+    for attr in ("downloadCode", "download_code", "code"):
+        v = getattr(img, attr, None)
+        if v:
+            return v
+    return None
 
 
 class KBChatbotHandler:
@@ -89,37 +138,75 @@ class KBChatbotHandler:
                     handler_self._logger.error("could not parse incoming message: %s", e)
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-                text = _extract_text(incoming)
                 sender = getattr(incoming, "sender_nick", None) or getattr(
                     incoming, "sender_id", "unknown"
                 )
-                handler_self._logger.info(
-                    "DingTalk msg from %s (msgtype=%s): %r",
-                    sender,
-                    getattr(incoming, "message_type", "?"),
-                    text[:120],
-                )
+                msgtype = getattr(incoming, "message_type", "?")
 
-                if getattr(incoming, "message_type", None) != "text" or not text:
-                    self.reply_text(
-                        "请直接发送需要检索的关键词（纯文本）。",
-                        incoming,
+                # --- text branch (场景 1) ---
+                text = _extract_text(incoming)
+                if msgtype == "text" and text:
+                    handler_self._logger.info(
+                        "DingTalk text from %s: %r", sender, text[:120],
                     )
+                    reply = handle_message("dingtalk", text)
+                    _send_markdown(handler_self, self, incoming, reply)
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-                reply = handle_message("dingtalk", text)
-                # Markdown renders nicer in DingTalk than plain text,
-                # especially with code blocks for source filenames.
-                title = "知识库检索"
-                try:
-                    self.reply_markdown(title, reply, incoming)
-                except Exception as e:  # pragma: no cover
-                    handler_self._logger.warning(
-                        "reply_markdown failed (%s); falling back to reply_text",
-                        e,
+                # --- image branch (场景 2) ---
+                if msgtype == "image":
+                    download_code = _extract_image_download_code(incoming)
+                    handler_self._logger.info(
+                        "DingTalk image from %s (code=%s)", sender, download_code,
                     )
-                    self.reply_text(reply, incoming)
+                    if not download_code:
+                        self.reply_text(
+                            "📷 收到图片但无法获取 download_code,请确认机器人"
+                            "权限里有「接收图片」能力。",
+                            incoming,
+                        )
+                        return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
+                    tmp_path = None
+                    try:
+                        # download_file returns a Response object in
+                        # dingtalk_stream; .data holds the raw bytes.
+                        # If the SDK version differs, we fall back to
+                        # assuming it returns bytes directly.
+                        resp = self.download_file(download_code)
+                        image_bytes = getattr(resp, "data", None) or resp
+                        ext = _detect_image_ext(image_bytes)
+                        fd, tmp_path = tempfile.mkstemp(prefix="kb_dt_", suffix=ext)
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(image_bytes)
+                        reply = handle_image("dingtalk", tmp_path)
+                    except Exception as e:
+                        handler_self._logger.error(
+                            "DingTalk image handling failed: %s", e,
+                        )
+                        self.reply_text(
+                            f"📷 图片识别失败: {e}\n请改用文字直接发送,或换张图重试。",
+                            incoming,
+                        )
+                        return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+                    finally:
+                        if tmp_path:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+
+                    _send_markdown(handler_self, self, incoming, reply)
+                    return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+
+                # --- unsupported ---
+                handler_self._logger.info(
+                    "DingTalk unsupported msgtype=%s from %s", msgtype, sender,
+                )
+                self.reply_text(
+                    "请直接发送需要检索的关键词(纯文本)或题目截图(图片)。",
+                    incoming,
+                )
                 return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
         self._sdk_handler = _Handler()

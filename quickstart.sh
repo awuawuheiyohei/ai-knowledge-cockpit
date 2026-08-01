@@ -111,6 +111,19 @@ check() {
         dim "See IM_SETUP.md → WeCom section. Needs a public callback URL (e.g. ngrok)."
     fi
 
+    # Feishu credentials
+    local fs_ok=0
+    if [[ -n "${FEISHU_APP_ID:-}" && "${FEISHU_APP_ID}" != "cli_xxxxxxxxxxxxxxxx" \
+       && -n "${FEISHU_APP_SECRET:-}" && "${FEISHU_APP_SECRET}" != "your_feishu_app_secret_here" ]]; then
+        fs_ok=1
+    fi
+    if (( fs_ok )); then
+        ok "Feishu credentials: set (./quickstart.sh serve feishu will work)"
+    else
+        warn "Feishu credentials: missing (FEISHU_APP_ID / FEISHU_APP_SECRET)"
+        dim "See FEISHU_SETUP.md. Needs a public callback URL (e.g. ngrok) for Event Subscription."
+    fi
+
     # KB state
     if [[ -f "$ROOT/data/kb.sqlite" ]]; then
         local n_docs n_chunks
@@ -138,6 +151,7 @@ print(c.execute('SELECT COUNT(*) FROM chunks').fetchone()[0])
     ok "Environment is workable. Pick a command:"
     dim "  ./quickstart.sh serve          # init + ingest + start DingTalk"
     dim "  ./quickstart.sh serve wecom    # init + ingest + start WeCom"
+    dim "  ./quickstart.sh serve feishu   # init + ingest + start Feishu (Lark)"
     dim "  ./quickstart.sh serve cli      # init + ingest + drop into a search prompt"
     exit 0
 }
@@ -151,14 +165,14 @@ serve() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ocr) want_ocr=1; shift ;;
-            dingtalk|wecom|cli) platform="$1"; shift ;;
+            dingtalk|wecom|feishu|cli) platform="$1"; shift ;;
             -h|--help)
-                echo "Usage: ./quickstart.sh serve [--ocr] [dingtalk|wecom|cli]"
+                echo "Usage: ./quickstart.sh serve [--ocr] [dingtalk|wecom|feishu|cli]"
                 exit 0
                 ;;
             *)
                 err "Unknown arg: $1"
-                echo "Usage: ./quickstart.sh serve [--ocr] [dingtalk|wecom|cli]"
+                echo "Usage: ./quickstart.sh serve [--ocr] [dingtalk|wecom|feishu|cli]"
                 exit 2
                 ;;
         esac
@@ -218,10 +232,18 @@ serve() {
             [[ -z "${WECOM_ENCODING_AES_KEY:-}" ]] && missing+=("WECOM_ENCODING_AES_KEY")
             if (( ${#missing[@]} > 0 )); then
                 err "WeCom credentials missing in .env: ${missing[*]}"
-                dim "Either fill them in and rerun, or use: ./quickstart.sh serve dingtalk|cli"
+                dim "Either fill them in and rerun, or use: ./quickstart.sh serve dingtalk|feishu|cli"
                 exit 1
             fi
             exec "$ROOT/.venv/bin/python" "$ROOT/app.py" serve wecom
+            ;;
+        feishu)
+            if [[ -z "${FEISHU_APP_ID:-}" || -z "${FEISHU_APP_SECRET:-}" ]]; then
+                err "Feishu credentials missing in .env (FEISHU_APP_ID / FEISHU_APP_SECRET)."
+                dim "Either fill them in and rerun, or use: ./quickstart.sh serve dingtalk|wecom|cli"
+                exit 1
+            fi
+            exec "$ROOT/.venv/bin/python" "$ROOT/app.py" serve feishu
             ;;
     esac
 }

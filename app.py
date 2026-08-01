@@ -328,6 +328,29 @@ def cmd_serve_dingtalk(args) -> int:
         return 0
 
 
+def cmd_serve_feishu(args) -> int:
+    """
+    Start the Feishu (Lark) bot webhook server.
+
+    Needs a public HTTPS callback URL (use ngrok for local dev).
+    The webhook URL is configured in the Feishu developer console's
+    "Event Subscription" section. See FEISHU_SETUP.md.
+    """
+    try:
+        from feishu_server import serve as fs_serve
+    except ImportError as e:
+        print(f"feishu_server not available: {e}", file=sys.stderr)
+        return 2
+    try:
+        fs_serve()
+        return 0
+    except ValueError as e:
+        print(f"Feishu config error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -387,6 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="start the DingTalk Stream-mode bot (WebSocket, no public URL needed)",
     )
     p_serve_dt.set_defaults(func=cmd_serve_dingtalk)
+    p_serve_fs = serve_sub.add_parser(
+        "feishu",
+        help="start the Feishu (Lark) webhook bot (HTTP, needs public URL or ngrok)",
+    )
+    p_serve_fs.set_defaults(func=cmd_serve_feishu)
 
     return p
 
