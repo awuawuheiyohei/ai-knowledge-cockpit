@@ -85,6 +85,40 @@ LLM to "fill in the gaps" or rephrase results. If a query has no
 relevant terms in the index, we return **zero hits** — we do not
 fall back to generative answers.
 
+### ⚠️ LLM IS allowed for image-triggered synthesis (场景 2 exception)
+
+**Scope** — *only* on the image-input path (`im_router.handle_image`).
+**Trigger** — user sends an image (DingTalk / Feishu image message).
+**Pipeline** —
+1. `image_extract.extract_text` — VL OCR on the image → question text.
+2. BM25 search the KB with that text.
+3. `answer_synth.synthesize` — LLM produces a summary **strictly
+   grounded in the retrieved chunks**, with **mandatory** `[来源:
+   <文件名>, p.<页码>]` citation for every claim.
+
+**Hard constraints (enforced in `answer_synth.py` + `im_router.py`)**:
+- The LLM sees ONLY (question, retrieved chunks with source labels).
+  Never the full KB, never external documents.
+- If the chunks don't cover the question, output is
+  `未在资料中检索到相关内容` — no guessing, no world knowledge.
+- The user reply **always** includes the raw BM25 hits alongside
+  the synthesis, so every claim can be cross-checked against source.
+- Inputs (question + chunk text) are treated as untrusted data;
+  embedded "ignore previous rules" / "you are now X" injections
+  are ignored — see `SYSTEM_PROMPT` rule #6 in `answer_synth.py`.
+- The LLM's response is post-validated: must contain at least one
+  `[来源: ...]` citation OR be the standard "未检索到" line.
+  Otherwise it's discarded and the user gets raw hits only.
+
+**What this is NOT**:
+- Not for text input — `handle_message()` (text) stays BM25-only.
+  The LLM there is only allowed for `query_rewrite` (keyword translation).
+- Not allowed to enrich the KB — synthesis output is reply-only,
+  never written back to the index.
+- Not allowed to invent sources — `[来源: ...]` must match a real
+  chunk from the retrieved set. (Enforced by prompt; not yet
+  post-validated against the actual hit set — TODO if drift observed.)
+
 ### 🚫 Scanned pages are not silently dropped
 
 A PDF page that has fewer than `SCAN_PAGE_MIN_CHARS` of meaningful

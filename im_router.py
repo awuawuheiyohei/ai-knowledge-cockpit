@@ -9,6 +9,19 @@ strictly opt-in per call (auto when BM25 is weak, force via /expand) and
 strictly scoped to reformulating the user's query string into keywords.
 The LLM never sees the KB and never produces the final answer — the user
 still sees only KB excerpts with source citations.
+
+Two entry points
+---------------
+- `handle_message(platform, raw_text)` — text input. 场景 1: raw mode only.
+  LLM is NEVER allowed to "synthesize" / "summarize" / "answer" here —
+  only keyword rewriting. The reply is always KB excerpts + source tags.
+
+- `handle_image(platform, image_path)` — image input. 场景 2: synth mode.
+  This is the ONLY place the LLM is allowed to produce a synthesized
+  answer (per the "image-triggered + mandatory citation" exception in
+  CLAUDE.md "Hard rules"). The synthesis MUST cite a source for every
+  claim, and the raw hits are always included alongside the synthesis
+  so the user can verify.
 """
 from __future__ import annotations
 
@@ -16,6 +29,8 @@ import config
 import search as search_mod
 import storage
 import query_rewrite
+import image_extract
+import answer_synth
 
 
 def _empty_help(platform: str) -> str:
@@ -221,3 +236,114 @@ def handle_message(platform: str, raw_text: str) -> str:
         return _format_hits_markdown(text, hits, weak=weak)
 
     return _no_hits(text)
+
+
+# ---------------------------------------------------------------------------
+# 场景 2: image input — VL OCR + BM25 + LLM synthesis (the ONE place LLM
+# is allowed to "synthesize"). Hard-coded rules in `answer_synth.SYSTEM_PROMPT`
+# ensure citation + no external knowledge.
+# ---------------------------------------------------------------------------
+
+def _format_image_reply(
+    extracted_text: str,
+    synth_answer: str,
+    synth_used: bool,
+    hits: list[dict],
+) -> str:
+    """
+    Build a Markdown reply for an image input.
+
+    Layout (always shown, even on failure):
+      1. The text the VL model extracted from the image (truncated).
+      2. The LLM synthesis (if valid), or the standard "未检索到" line.
+      3. The raw BM25 hits with source attribution, so the user can
+         always cross-check the synthesis against the source material.
+    """
+    lines: list[str] = []
+    lines.append("### 📷 识别的内容")
+    snippet = extracted_text.strip().replace("\n", " ")
+    if len(snippet) > 240:
+        snippet = snippet[:240].rstrip() + "…"
+    lines.append(f"> {snippet or '_(空)_'}")
+    lines.append("")
+
+    lines.append("### 🤖 综合回答")
+    if synth_used:
+        lines.append(synth_answer.strip())
+    else:
+        lines.append("_（LLM 综合未启用或失败,见下方原始资料）_")
+    lines.append("")
+
+    lines.append("### 📚 原始资料(请按文件名 + 页码回原文核对)")
+    if not hits:
+        lines.append("_(无命中)_")
+    else:
+        for i, h in enumerate(hits, start=1):
+            page = f"· p.{h['page_num']}" if h.get("page_num") is not None else "· md"
+            src = f"`{h['filename']}` {page}  ·  score={h['score']:.2f}"
+            lines.append(f"**[{i}]** {src}")
+            chunk = h["chunk_text"].strip().replace("\n", " ")
+            if len(chunk) > 220:
+                chunk = chunk[:220].rstrip() + "…"
+            lines.append(f"> {chunk}")
+            lines.append("")
+
+    lines.append("---")
+    lines.append(
+        "🔒 综合回答由 LLM 基于上方【原始资料】生成,**每条论断都应带 [来源: ...] 标注**;"
+        "若 LLM 引用了资料外的内容,请忽略该部分并以【原始资料】为准。"
+    )
+    return "\n".join(lines)
+
+
+def handle_image(platform: str, image_path: str) -> str:
+    """
+    Image input entry point (场景 2).
+
+    Pipeline:
+      1. image_extract.extract_text()  → user's question as text
+      2. search.search(question)       → top-K BM25 hits
+      3. answer_synth.synthesize(...)  → LLM summary, with mandatory
+         `[来源: ...]` citation per claim, OR "未在资料中检索到"
+      4. Format Markdown reply with: extracted text + synth + raw hits
+
+    Hard rule: the synth answer is NEVER trusted alone. The raw hits
+    are always shown alongside so the user (or a maintainer) can verify
+    every claim against the source KB content.
+    """
+    if not storage.list_documents():
+        return _empty_help(platform)
+
+    # 1. OCR / VL understanding of the image.
+    extracted = image_extract.extract_text(image_path)
+    if not extracted:
+        return (
+            "📷 图片识别失败,可能原因:\n"
+            "- 格式不支持(支持 jpg / png / gif / webp)\n"
+            "- VL 凭证缺失或网络错误\n"
+            "- 图片中无文字\n\n"
+            "请改用文字直接发送,或换张图重试。"
+        )
+
+    # 2. BM25 search using the extracted text as the query.
+    hits = search_mod.search(extracted, top_k=config.DEFAULT_TOP_K)
+
+    # 3. LLM synthesis (the only place LLM is allowed to "answer").
+    if not hits:
+        return _format_image_reply(
+            extracted_text=extracted,
+            synth_answer="",
+            synth_used=False,
+            hits=[],
+        )
+
+    synth = answer_synth.synthesize(extracted, hits)
+
+    # 4. Assemble reply — ALWAYS show the raw hits, even if synth was
+    #    used. The user can ignore them, but they need to be visible.
+    return _format_image_reply(
+        extracted_text=extracted,
+        synth_answer=synth.answer,
+        synth_used=synth.used_synth,
+        hits=hits,
+    )
