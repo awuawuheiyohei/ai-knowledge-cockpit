@@ -256,14 +256,16 @@ def _format_image_reply(
     Layout (always shown, even on failure):
       1. The text the VL model extracted from the image (truncated).
       2. The LLM synthesis (if valid), or the standard "未检索到" line.
-      3. The raw BM25 hits with source attribution, so the user can
-         always cross-check the synthesis against the source material.
+      3. The raw BM25 hits (DEDUPED by content fingerprint) so the user
+         can always cross-check the synthesis against source material,
+         without seeing the same question 4 times because of overlapping
+         chunks.
     """
     lines: list[str] = []
     lines.append("### 📷 识别的内容")
     snippet = extracted_text.strip().replace("\n", " ")
-    if len(snippet) > 240:
-        snippet = snippet[:240].rstrip() + "…"
+    if len(snippet) > 600:
+        snippet = snippet[:600].rstrip() + "…"
     lines.append(f"> {snippet or '_(空)_'}")
     lines.append("")
 
@@ -275,10 +277,11 @@ def _format_image_reply(
     lines.append("")
 
     lines.append("### 📚 原始资料(请按文件名 + 页码回原文核对)")
-    if not hits:
+    deduped = _dedupe_hits_for_display(hits)
+    if not deduped:
         lines.append("_(无命中)_")
     else:
-        for i, h in enumerate(hits, start=1):
+        for i, h in enumerate(deduped, start=1):
             page = f"· p.{h['page_num']}" if h.get("page_num") is not None else "· md"
             src = f"`{h['filename']}` {page}  ·  score={h['score']:.2f}"
             lines.append(f"**[{i}]** {src}")
@@ -294,6 +297,55 @@ def _format_image_reply(
         "若 LLM 引用了资料外的内容,请忽略该部分并以【原始资料】为准。"
     )
     return "\n".join(lines)
+
+
+def _dedupe_hits_for_display(hits: list[dict], max_display: int = 3) -> list[dict]:
+    """
+    Dedupe BM25 hits for cleaner display.
+
+    Question-bank PDFs get chunked such that the same question +
+    options + answer + explanation ends up in 3-5 overlapping chunks
+    (because CHUNK_SIZE=400 < full question length ~600 chars).
+    BM25 then scores all of them highly, and the user sees the same
+    paragraph N times.
+
+    Two-pass dedup:
+      1. Keep the highest-scoring chunk per (filename, page_num). A
+         question spanning 2 pages is still 2 distinct hits, which
+         is what we want.
+      2. Then dedup remaining by content prefix (first 200 chars),
+         to collapse near-identical chunks that landed on the same
+         page (e.g. from CHUNK_OVERLAP=60).
+      3. Cap at `max_display` to keep the reply readable.
+
+    NOTE: this is a display-layer fix, not a chunking fix. The chunks
+    themselves are still duplicated in the KB; the right long-term
+    answer is to bump CHUNK_SIZE in config.py + rebuild, but that
+    affects all documents. Display dedup is safe and instant.
+    """
+    if not hits:
+        return []
+
+    # Pass 1: one hit per (file, page) — keep highest score
+    by_page: dict[tuple, dict] = {}
+    for h in hits:
+        key = (h.get("filename", ""), h.get("page_num"))
+        if key not in by_page or h["score"] > by_page[key]["score"]:
+            by_page[key] = h
+
+    # Pass 2: dedup by content prefix (200 chars) within page-grouped hits
+    seen_prefixes: set[str] = set()
+    final: list[dict] = []
+    for h in sorted(by_page.values(), key=lambda x: -x["score"]):
+        prefix = (h.get("chunk_text") or "").strip().replace("\n", " ")[:200]
+        if prefix in seen_prefixes:
+            continue
+        seen_prefixes.add(prefix)
+        final.append(h)
+        if len(final) >= max_display:
+            break
+
+    return final
 
 
 def handle_image(platform: str, image_path: str) -> str:

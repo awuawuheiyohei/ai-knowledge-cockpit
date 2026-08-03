@@ -18,6 +18,20 @@ This module subscribes to the ChatbotMessage topic and routes incoming
 text AND images into `im_router.handle_message()` / `im_router.handle_image()`.
 Replies go back as Markdown.
 
+DingTalk message_type values
+----------------------------
+- "text"     — plain text. Field: incoming.text.content
+- "picture"  — image.       Field: incoming.image_content.download_code
+- "richText" — rich text.   Field: incoming.rich_text_content (not yet handled)
+
+Hard-won knowledge (2026-08-03 first E2E test)
+-----------------------------------------------
+The SDK's `get_image_download_url()` makes a `requests.post()` with NO
+timeout. If DingTalk's API gateway hangs or the network is slow, the
+whole bot process hangs in image processing and never replies. We
+wrap it in `concurrent.futures` with an explicit timeout (15s) so
+the user gets a clear error instead of an indefinite wait.
+
 Reference: https://github.com/open-dingtalk/dingtalk-stream-sdk-python
 """
 from __future__ import annotations
@@ -27,7 +41,10 @@ import logging
 import os
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Optional
+
+import requests
 
 import paths  # noqa: F401  — ensure dirs exist on import
 import storage
@@ -96,21 +113,55 @@ def _detect_image_ext(data: bytes) -> str:
 
 def _extract_image_download_code(incoming) -> Optional[str]:
     """
-    Extract the image download_code from a DingTalk image ChatbotMessage.
+    Extract the image download_code from a DingTalk 'picture' ChatbotMessage.
 
-    The SDK's ChatbotMessage.image object has changed field names across
-    versions; we try the common ones defensively.
+    Per the SDK source, image messages have:
+      - message_type == "picture"
+      - incoming.image_content.download_code (snake_case)
     """
-    if getattr(incoming, "message_type", None) != "image":
+    if getattr(incoming, "message_type", None) != "picture":
         return None
-    img = getattr(incoming, "image", None)
+    img = getattr(incoming, "image_content", None)
     if img is None:
         return None
-    for attr in ("downloadCode", "download_code", "code"):
-        v = getattr(img, attr, None)
-        if v:
-            return v
-    return None
+    return getattr(img, "download_code", None)
+
+
+def _download_dingtalk_image(handler_self, sdk_handler, download_code: str) -> bytes:
+    """
+    Two-step download, both steps explicitly time-bounded so the bot
+    never hangs silently waiting for DingTalk.
+
+    The SDK's `get_image_download_url` does `requests.post()` with no
+    timeout. If DingTalk's gateway is slow, the whole process stalls.
+    We wrap it in a thread + future timeout (15s) and re-raise on
+    timeout so the user gets a clear error.
+    """
+    handler_self._logger.info(
+        "DingTalk image download: requesting URL (code=%s…)",
+        download_code[:16],
+    )
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(sdk_handler.get_image_download_url, download_code)
+        try:
+            download_url = future.result(timeout=15)
+        except FutureTimeout:
+            raise RuntimeError(
+                f"DingTalk get_image_download_url timed out after 15s "
+                f"(code={download_code[:16]}…)"
+            )
+    if not download_url:
+        raise RuntimeError(
+            f"DingTalk get_image_download_url returned empty "
+            f"(code={download_code[:16]}…)"
+        )
+    handler_self._logger.info("DingTalk image download: got URL, fetching bytes…")
+    resp = requests.get(download_url, timeout=30)
+    resp.raise_for_status()
+    handler_self._logger.info(
+        "DingTalk image download: got %d bytes", len(resp.content)
+    )
+    return resp.content
 
 
 class KBChatbotHandler:
@@ -154,10 +205,11 @@ class KBChatbotHandler:
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
                 # --- image branch (场景 2) ---
-                if msgtype == "image":
+                if msgtype == "picture":
                     download_code = _extract_image_download_code(incoming)
                     handler_self._logger.info(
-                        "DingTalk image from %s (code=%s)", sender, download_code,
+                        "DingTalk picture from %s (code=%s)", sender,
+                        (download_code or "")[:16] + "…" if download_code else "<none>",
                     )
                     if not download_code:
                         self.reply_text(
@@ -167,36 +219,60 @@ class KBChatbotHandler:
                         )
                         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-                    tmp_path = None
-                    try:
-                        # download_file returns a Response object in
-                        # dingtalk_stream; .data holds the raw bytes.
-                        # If the SDK version differs, we fall back to
-                        # assuming it returns bytes directly.
-                        resp = self.download_file(download_code)
-                        image_bytes = getattr(resp, "data", None) or resp
-                        ext = _detect_image_ext(image_bytes)
-                        fd, tmp_path = tempfile.mkstemp(prefix="kb_dt_", suffix=ext)
-                        with os.fdopen(fd, "wb") as f:
-                            f.write(image_bytes)
-                        reply = handle_image("dingtalk", tmp_path)
-                    except Exception as e:
+                    # Watchdog: the whole image pipeline (download +
+                    # VL OCR + LLM synth) should finish in <2 min even
+                    # on a slow network. If it takes longer we abort and
+                    # tell the user, so they always get SOME response
+                    # within 2 min instead of an indefinite hang.
+                    reply_box: list = [None]
+                    err_box: list = [None]
+
+                    def _image_pipeline():
+                        tmp_path = None
+                        try:
+                            image_bytes = _download_dingtalk_image(
+                                handler_self, self, download_code,
+                            )
+                            ext = _detect_image_ext(image_bytes)
+                            fd, tmp_path = tempfile.mkstemp(prefix="kb_dt_", suffix=ext)
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(image_bytes)
+                            reply_box[0] = handle_image("dingtalk", tmp_path)
+                        except Exception as e:
+                            err_box[0] = e
+                        finally:
+                            if tmp_path:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        future = ex.submit(_image_pipeline)
+                        try:
+                            future.result(timeout=120)
+                        except FutureTimeout:
+                            handler_self._logger.error(
+                                "DingTalk image pipeline timed out after 120s"
+                            )
+                            self.reply_text(
+                                "📷 图片处理超时(>120s)。可能原因:网络慢、"
+                                "VL 凭证失效、或图片过大。请重试,或改用文字。",
+                                incoming,
+                            )
+                            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+
+                    if err_box[0]:
                         handler_self._logger.error(
-                            "DingTalk image handling failed: %s", e,
+                            "DingTalk image handling failed: %s", err_box[0],
                         )
                         self.reply_text(
-                            f"📷 图片识别失败: {e}\n请改用文字直接发送,或换张图重试。",
+                            f"📷 图片识别失败: {err_box[0]}\n请改用文字直接发送,或换张图重试。",
                             incoming,
                         )
                         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-                    finally:
-                        if tmp_path:
-                            try:
-                                os.unlink(tmp_path)
-                            except OSError:
-                                pass
 
-                    _send_markdown(handler_self, self, incoming, reply)
+                    _send_markdown(handler_self, self, incoming, reply_box[0])
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
                 # --- unsupported ---

@@ -36,7 +36,9 @@ class LlmConfig:
     base_url: str
     model: str
     timeout_s: int
-    max_tokens: int
+    max_tokens: int            # for query rewrite (small)
+    synth_max_tokens: int      # for answer synthesis (large; needs room
+                              # for citations + multi-option analysis)
 
 
 def is_llm_configured() -> bool:
@@ -74,4 +76,8 @@ def load_llm_config() -> LlmConfig:
         model=model,
         timeout_s=int(os.environ.get("LLM_TIMEOUT_S", "30")),
         max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "200")),
+        # answer synthesis needs much more room than query rewrite —
+        # default 200 is fine for keyword extraction, but a full
+        # synthesis with citations + multi-option analysis needs ~2000.
+        synth_max_tokens=int(os.environ.get("LLM_SYNTH_MAX_TOKENS", "2000")),
     )

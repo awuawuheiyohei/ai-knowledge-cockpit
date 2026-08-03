@@ -122,9 +122,13 @@ def _call_llm(user_prompt: str) -> str:
     """Single LLM call → raw text response."""
     cfg = llm_config.load_llm_config()
     client = _build_client(cfg)
+    # Use synth_max_tokens (default 2000) — answer synthesis with
+    # citations + multi-option analysis needs much more room than the
+    # 200-token default for query_rewrite. Without this, the LLM
+    # gets cut off mid-sentence after "B: 通过".
     response = client.messages.create(
         model=cfg.model,
-        max_tokens=cfg.max_tokens,
+        max_tokens=cfg.synth_max_tokens,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": [{"type": "text", "text": user_prompt}]}],
     )
