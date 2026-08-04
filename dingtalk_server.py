@@ -272,7 +272,16 @@ class KBChatbotHandler:
                         )
                         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-                    _send_markdown(handler_self, self, incoming, reply_box[0])
+                    # Long-message split: DingTalk Markdown caps at ~4000
+                    # chars. Send as multiple messages so we never lose
+                    # the synth or the raw hits to silent truncation.
+                    chunks = im_router._split_for_im(reply_box[0])
+                    handler_self._logger.info(
+                        "DingTalk image reply: %d chars → %d chunk(s)",
+                        len(reply_box[0]), len(chunks),
+                    )
+                    for chunk in chunks:
+                        _send_markdown(handler_self, self, incoming, chunk)
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
                 # --- unsupported ---

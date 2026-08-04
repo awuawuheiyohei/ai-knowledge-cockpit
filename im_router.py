@@ -348,6 +348,68 @@ def _dedupe_hits_for_display(hits: list[dict], max_display: int = 3) -> list[dic
     return final
 
 
+def _split_for_im(reply: str, max_len: int = 3800) -> list[str]:
+    """
+    Split a long Markdown reply into multiple IM-sendable chunks.
+
+    Background
+    ----------
+    DingTalk Markdown messages are silently truncated by the SDK (or
+    the gateway) at ~4000 chars. Feishu `text` msg_type similarly caps
+    at 4000. A long image reply (synth + 3+ deduped hits) can easily
+    exceed that.
+
+    Strategy
+    --------
+    The image-reply Markdown has a clear separator:
+        ...synth...
+        ---
+        🔒 disclaimer
+    Split on the FIRST `\n---\n` if both halves are under max_len.
+    Otherwise fall back to per-paragraph splitting (with a "..." marker
+    if the result still exceeds max_len).
+
+    Returns a list of 1+ strings. The bot caller sends each in order.
+    """
+    if len(reply) <= max_len:
+        return [reply]
+
+    # Try the natural split at the disclaimer separator.
+    sep = "\n---\n"
+    idx = reply.find(sep)
+    if idx > 0:
+        head = reply[: idx + 1].rstrip()      # keep the closing "---" on head
+        tail = reply[idx + len(sep) :]
+        if len(head) <= max_len and len(tail) <= max_len:
+            # Add a "continued ↓" hint to the first chunk so the user
+            # knows there's a follow-up.
+            if not head.endswith("\n"):
+                head += "\n"
+            return [head + "\n_（续 ↓）_", tail]
+
+    # Fallback: split at paragraph boundaries.
+    chunks: list[str] = []
+    current = ""
+    for line in reply.split("\n"):
+        if len(current) + len(line) + 1 > max_len and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+
+    # Last-resort: if any single chunk is still too long, hard-truncate
+    # it with a marker so the user knows it's been clipped.
+    final: list[str] = []
+    for c in chunks:
+        if len(c) > max_len:
+            final.append(c[: max_len - 30].rstrip() + "\n\n_…（已截断）_")
+        else:
+            final.append(c)
+    return final
+
+
 def handle_image(platform: str, image_path: str) -> str:
     """
     Image input entry point (场景 2).
