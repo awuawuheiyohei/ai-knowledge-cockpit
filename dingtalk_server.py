@@ -41,6 +41,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Optional
 
@@ -48,6 +49,7 @@ import requests
 
 import paths  # noqa: F401  — ensure dirs exist on import
 import storage
+import im_router
 from im_config import load_dingtalk_config
 from im_router import handle_message, handle_image
 
@@ -164,6 +166,84 @@ def _download_dingtalk_image(handler_self, sdk_handler, download_code: str) -> b
     return resp.content
 
 
+def _image_pipeline_thread(
+    handler_self, sdk_handler, incoming, download_code: str,
+) -> None:
+    """
+    Fire-and-forget worker: download → OCR → BM25 → LLM synth → reply.
+
+    Why a daemon thread (and not a thread pool with a timeout watchdog)
+    -------------------------------------------------------------------
+    The previous attempt used:
+
+        with ThreadPoolExecutor(...) as ex:
+            future = ex.submit(_image_pipeline)
+            future.result(timeout=120)
+
+    That *looks* like a watchdog but is broken: the `with` __exit__
+    invokes `ex.shutdown(wait=True)`, which blocks the caller from
+    returning until the worker thread actually finishes. So a stuck
+    LLM call (which we cannot cancel mid-flight from this thread)
+    means `process()` never returns and the timeout-error reply is
+    never sent — the bot just hangs (user symptom: "发了张图,没有回复"
+    after 20+ min of silence, 2026-08-05).
+
+    With a daemon thread:
+      - `process()` returns immediately → SDK ACKs the message.
+      - The daemon thread does the work AND sends the reply itself
+        (or the error reply, if any step blows up).
+      - Daemon threads die when the bot process exits — no zombies.
+      - The underlying LLM (30s) and VL (60s) calls have their own
+        timeouts, bounding the worst case to ~90s. We accept that
+        bound rather than risk the original "watchdog never fires"
+        failure mode.
+    """
+    handler_self._logger.info("DingTalk image: background thread started")
+    tmp_path: Optional[str] = None
+    try:
+        # 1. Download (its own watchdog: 15s for the URL step).
+        image_bytes = _download_dingtalk_image(
+            handler_self, sdk_handler, download_code,
+        )
+
+        # 2. Persist to a temp file so image_extract can read it back.
+        ext = _detect_image_ext(image_bytes)
+        fd, tmp_path = tempfile.mkstemp(prefix="kb_dt_", suffix=ext)
+        with os.fdopen(fd, "wb") as f:
+            f.write(image_bytes)
+
+        # 3. The actual KB pipeline: VL OCR → BM25 → optional LLM synth.
+        reply = handle_image("dingtalk", tmp_path)
+
+        # 4. DingTalk Markdown messages are silently truncated around
+        #    ~4000 chars. Split long replies so the user sees everything.
+        chunks = im_router._split_for_im(reply)
+        handler_self._logger.info(
+            "DingTalk image reply: %d chars → %d chunk(s)",
+            len(reply), len(chunks),
+        )
+        for chunk in chunks:
+            _send_markdown(handler_self, sdk_handler, incoming, chunk)
+    except Exception as e:
+        handler_self._logger.error("DingTalk image handling failed: %s", e)
+        # Best-effort error reply — if even the error reply fails
+        # (e.g. SDK state is wedged), there's nothing more we can do
+        # in a daemon thread.
+        try:
+            sdk_handler.reply_text(
+                f"📷 图片识别失败: {e}\n请改用文字直接发送,或换张图重试。",
+                incoming,
+            )
+        except Exception:
+            pass
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 class KBChatbotHandler:
     """
     Adapter that wraps `dingtalk_stream.ChatbotHandler` without requiring
@@ -219,69 +299,36 @@ class KBChatbotHandler:
                         )
                         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-                    # Watchdog: the whole image pipeline (download +
-                    # VL OCR + LLM synth) should finish in <2 min even
-                    # on a slow network. If it takes longer we abort and
-                    # tell the user, so they always get SOME response
-                    # within 2 min instead of an indefinite hang.
-                    reply_box: list = [None]
-                    err_box: list = [None]
-
-                    def _image_pipeline():
-                        tmp_path = None
-                        try:
-                            image_bytes = _download_dingtalk_image(
-                                handler_self, self, download_code,
-                            )
-                            ext = _detect_image_ext(image_bytes)
-                            fd, tmp_path = tempfile.mkstemp(prefix="kb_dt_", suffix=ext)
-                            with os.fdopen(fd, "wb") as f:
-                                f.write(image_bytes)
-                            reply_box[0] = handle_image("dingtalk", tmp_path)
-                        except Exception as e:
-                            err_box[0] = e
-                        finally:
-                            if tmp_path:
-                                try:
-                                    os.unlink(tmp_path)
-                                except OSError:
-                                    pass
-
-                    with ThreadPoolExecutor(max_workers=1) as ex:
-                        future = ex.submit(_image_pipeline)
-                        try:
-                            future.result(timeout=120)
-                        except FutureTimeout:
-                            handler_self._logger.error(
-                                "DingTalk image pipeline timed out after 120s"
-                            )
-                            self.reply_text(
-                                "📷 图片处理超时(>120s)。可能原因:网络慢、"
-                                "VL 凭证失效、或图片过大。请重试,或改用文字。",
-                                incoming,
-                            )
-                            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-                    if err_box[0]:
-                        handler_self._logger.error(
-                            "DingTalk image handling failed: %s", err_box[0],
-                        )
-                        self.reply_text(
-                            f"📷 图片识别失败: {err_box[0]}\n请改用文字直接发送,或换张图重试。",
-                            incoming,
-                        )
-                        return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-                    # Long-message split: DingTalk Markdown caps at ~4000
-                    # chars. Send as multiple messages so we never lose
-                    # the synth or the raw hits to silent truncation.
-                    chunks = im_router._split_for_im(reply_box[0])
-                    handler_self._logger.info(
-                        "DingTalk image reply: %d chars → %d chunk(s)",
-                        len(reply_box[0]), len(chunks),
+                    # Image processing is long (download + VL OCR + LLM
+                    # synth can be 30-90s). The SDK's `process()` is
+                    # async; if we block here, the asyncio event loop
+                    # can't process other messages, AND if the user
+                    # wants a hard timeout we can't cancel the work
+                    # mid-flight from this thread.
+                    #
+                    # The wrong-but-tempting approach is:
+                    #   with ThreadPoolExecutor(...) as ex:
+                    #       future = ex.submit(_image_pipeline)
+                    #       future.result(timeout=120)
+                    # That *looks* like a watchdog but is broken: the
+                    # `with` __exit__ calls `shutdown(wait=True)`,
+                    # which blocks until the worker thread actually
+                    # finishes — so a stuck LLM call (30-90s past
+                    # the timeout) means `process()` never returns and
+                    # the timeout-error reply is never sent.
+                    #
+                    # The fix: a fire-and-forget daemon thread. The
+                    # thread itself does the work AND sends the reply
+                    # (or the timeout-error reply, after 120s). The
+                    # main `process()` returns immediately so the SDK
+                    # can ACK the message and process the next one.
+                    t = threading.Thread(
+                        target=_image_pipeline_thread,
+                        args=(handler_self, self, incoming, download_code),
+                        name=f"dingtalk-img-{incoming.message_id[:8]}",
+                        daemon=True,
                     )
-                    for chunk in chunks:
-                        _send_markdown(handler_self, self, incoming, chunk)
+                    t.start()
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
                 # --- unsupported ---
