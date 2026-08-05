@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Service identity -->
+  <key>Label</key>
+  <string>com.mavis.knowledge-bot</string>
+
+  <!-- What to run -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/.venv/bin/python</string>
+    <string>-u</string>
+    <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/app.py</string>
+    <string>serve</string>
+    <string>dingtalk</string>
+  </array>
+
+  <!-- Start on plist load + on every boot/login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on crash, but don't restart on clean exit
+       (so a manual `launchctl unload` stays unloaded). -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <!-- Background: don't compete with foreground apps for resources. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Logs (the logs/ dir must exist before launchctl load). -->
+  <key>StandardOutPath</key>
+  <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/logs/dingtalk_bot.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/logs/dingtalk_bot.err.log</string>
+
+  <!-- CWD so app.py finds ./data/, ./data/kb.sqlite, ./.env, etc. -->
+  <key>WorkingDirectory</key>
+  <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit</string>
+</dict>
+</plist>
