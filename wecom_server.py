@@ -302,7 +302,7 @@ def make_app() -> Flask:
         if incoming.msg_type != "text":
             reply_text = "暂时只支持文字消息，请直接发送关键词。"
         else:
-            reply_text = handle_message("wecom", incoming.content)
+            reply_text = handle_message("wecom", incoming.content, user_id=incoming.from_user_name)
 
         reply_xml = _build_text_reply_xml(
             from_user=incoming.to_user_name,

@@ -25,6 +25,12 @@ Two entry points
 """
 from __future__ import annotations
 
+import json
+import time
+from datetime import datetime
+
+import paths
+
 import config
 import search as search_mod
 import storage
@@ -46,11 +52,165 @@ def _no_hits(query: str) -> str:
     """Reply when no relevant chunks are found."""
     return (
         f"未在知识库中找到与 **{query}** 相关的内容。\n\n"
-        "可能的原因：\n"
+        "可能的原因:\n"
         "- 用词太专业 / 太长 → 换个近义词试试\n"
         "- 该知识点还没入库 → 跑 `python app.py ingest ...`\n"
         "- 该知识点所在页面是扫描件 → 用 OCR 工具转 .md 后再入库"
     )
+
+
+# ---------------------------------------------------------------------------
+# Source-attribution rendering helpers (Day 5 — clickable file:// links)
+# ---------------------------------------------------------------------------
+
+def _source_link(hit: dict) -> str:
+    """
+    Render one source citation as a Markdown line, with a clickable
+    `file://` link when we have a local PDF (and the platform renders
+    Markdown links). Falls back to a code-formatted path so the user
+    always sees the location even on platforms that strip Markdown links
+    (some IM clients do).
+
+    The link uses `#page=N` which is the de-facto convention for jumping
+    to a specific page in a PDF — works in macOS Preview, most modern
+    PDF readers, and many editors.
+    """
+    filename = hit.get("filename", "?")
+    page = hit.get("page_num")
+    score = hit.get("score", 0.0)
+    relpath = hit.get("relative_path", "")
+    if relpath:
+        abs_path = paths.BASE / relpath
+        if abs_path.exists():
+            path_str = str(abs_path.resolve())
+            if page is not None:
+                # Clickable link (in Markdown-rendering clients) +
+                # plain-text path right after, so the user always sees
+                # the source even if the link is dropped.
+                return (
+                    f"**[{filename} p.{page}](file://{path_str}#page={page})** "
+                    f"· `{path_str}`  ·  score={score:.2f}"
+                )
+            # Markdown source (no page number) — link to the file itself.
+            return (
+                f"**[{filename}](file://{path_str})** "
+                f"· `{path_str}`  ·  score={score:.2f}"
+            )
+    # Fallback: no relative_path on the hit (shouldn't happen post-ingest,
+    # but be defensive) — just show the filename + page.
+    if page is not None:
+        return f"`{filename}` · p.{page}  ·  score={score:.2f}"
+    return f"`{filename}` (md)  ·  score={score:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# User feedback loop (Day 4 — /good /bad /partial)
+# ---------------------------------------------------------------------------
+# Per-(platform, user_id) in-memory record of the LAST bot reply. The
+# /good /bad /partial slash commands look this up to attach a verdict.
+# Module-level (not in handle_message) so it survives across message
+# calls but is cleared on bot restart. For our single-user-ish use case
+# (one operator + maybe a few family members) this is sufficient;
+# multi-tenant SaaS would need Redis.
+_LAST_REPLIES: dict[tuple[str, str], dict] = {}
+_LAST_REPLIES_TTL_S = 30 * 60  # 30 min — feedback must be timely
+
+
+def _record_last_reply(platform: str, user_id: str, question: str, reply: str,
+                       message_type: str = "text") -> None:
+    """Stash the last reply so /good /bad /partial can attach to it."""
+    if not user_id:
+        return
+    key = (platform, user_id)
+    _LAST_REPLIES[key] = {
+        "ts": time.time(),
+        "question": (question or "")[:500],
+        "reply": (reply or "")[:3000],
+        "message_type": message_type,
+    }
+    # Opportunistic GC — drop entries older than TTL.
+    cutoff = time.time() - _LAST_REPLIES_TTL_S
+    for k in list(_LAST_REPLIES.keys()):
+        if _LAST_REPLIES[k]["ts"] < cutoff:
+            del _LAST_REPLIES[k]
+
+
+def _pop_last_reply(platform: str, user_id: str) -> dict | None:
+    """Return AND REMOVE the last reply record (one-shot feedback)."""
+    key = (platform, user_id)
+    return _LAST_REPLIES.pop(key, None)
+
+
+def save_feedback(platform: str, user_id: str, verdict: str,
+                  last_context: dict, note: str = "") -> tuple[bool, str]:
+    """
+    Append a user feedback record to `data/feedback/YYYY-MM-DD.jsonl`.
+
+    Public API for the IM adapters' /good /bad /partial handlers. Each
+    adapter maintains its own per-user "last reply" dict and calls this
+    on feedback. The adapter may also have its own note (e.g. user
+    typed `/bad answer was about the wrong chapter`); that's `note`.
+
+    Returns (ok, message_for_user).
+    """
+    if verdict not in ("good", "bad", "partial"):
+        return False, f"未知反馈类型: {verdict}"
+    if not last_context:
+        return False, "找不到上一条回复(可能 bot 刚重启,或反馈命令离上一条回复超过 30 分钟)"
+
+    paths.ensure_dirs()
+    feedback_dir = paths.DATA / "feedback"
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    fname = feedback_dir / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+
+    record = {
+        "ts": time.time(),
+        "platform": platform,
+        "user_id": user_id,
+        "verdict": verdict,
+        "note": (note or "")[:500],
+        "last_reply": {
+            "question": (last_context.get("question") or "")[:500],
+            "reply": (last_context.get("reply") or "")[:3000],
+            "message_type": last_context.get("message_type", "text"),
+        },
+    }
+    with open(fname, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return True, f"📝 反馈已记录({verdict})。" + (f" 备注: {note}" if note else "")
+
+
+def _handle_feedback(platform: str, user_id: str, verdict: str) -> str:
+    """Handle /good /bad /partial — pop the last reply and save it."""
+    if not user_id:
+        return "⚠️ 该平台未传入 user_id,反馈功能不可用(联系开发者)。"
+    last = _pop_last_reply(platform, user_id)
+    if last is None:
+        return (
+            "⚠️ 找不到上一条回复。\n\n"
+            "反馈命令必须跟在 bot 回复之后(< 30 分钟内)。\n"
+            "先问一个问题 → 等回复 → 再发 `/good` `/bad` 或 `/partial`。"
+        )
+    ok, msg = save_feedback(platform, user_id, verdict, last)
+    return msg if ok else f"⚠️ {msg}"
+
+
+# ---------------------------------------------------------------------------
+# /help text — single source of truth so all platforms stay in sync
+# ---------------------------------------------------------------------------
+_HELP_TEXT = (
+    "**AI Knowledge Cockpit · 帮助**\n\n"
+    "- 直接发送关键词,我会检索本地知识库并附来源\n"
+    "- 输入模糊、口语化也没事——我会在 BM25 弱命中时**自动用 LLM 改写 query** 再查\n"
+    "- 加 `/expand` 前缀强制改写(即使 BM25 强命中)\n"
+    "- `/status` 查看知识库统计\n"
+    "- `/good` `/bad` `/partial` 对上一条 bot 回复打分(30 分钟内有效)\n"
+    "- `/help`  查看本帮助\n\n"
+    "**硬规则**:\n"
+    "- LLM 只用来改写 query 和(图片场景)综合,**绝不**凭空生成答案\n"
+    "- 最终答案均来自 KB 原文 + 来源标注\n"
+    "- 没找到就说没找到,不会编"
+)
 
 
 def _format_hits_markdown(
@@ -61,7 +221,15 @@ def _format_hits_markdown(
     rewritten_query: str | None = None,
     weak: bool = False,
 ) -> str:
-    """Format hits as Markdown with source attribution per chunk."""
+    """Format hits as Markdown with source attribution per chunk.
+
+    Day 5 (2026-08-06): source citations now use clickable `file://` links
+    when we can resolve the absolute path of the source file. On platforms
+    that render Markdown links (most modern IM clients), clicking jumps
+    straight to the cited page in the PDF. On platforms that strip links,
+    the full path is also shown as inline code so the user can copy and
+    open it manually.
+    """
     lines: list[str] = []
     if via_rewrite and rewritten_query and rewritten_query != query:
         lines.append(f"### 🔎 检索：{query}")
@@ -70,9 +238,7 @@ def _format_hits_markdown(
         lines.append(f"### 🔎 检索：{query}")
     lines.append(f"命中 {len(hits)} 条（按相关度排序）：\n")
     for i, h in enumerate(hits, start=1):
-        page = f"· p.{h['page_num']}" if h.get("page_num") is not None else "· md"
-        src = f"`{h['filename']}` {page}  ·  score={h['score']:.2f}"
-        lines.append(f"**[{i}]** {src}")
+        lines.append(f"**[{i}]** {_source_link(h)}")
         snippet = h["chunk_text"].strip().replace("\n", " ")
         if len(snippet) > 320:
             snippet = snippet[:320].rstrip() + "…"
@@ -116,62 +282,32 @@ def _should_auto_rewrite(query: str, hits: list[dict]) -> bool:
     return top_score < config.REWRITE_SCORE_THRESHOLD
 
 
-def handle_message(platform: str, raw_text: str) -> str:
+def _status_text() -> str:
+    """Render the /status reply. Pulled out so handle_message stays linear."""
+    stats = storage.corpus_stats()
+    docs = storage.list_documents()
+    if not docs:
+        return "知识库为空。"
+    scan_warnings = [d["filename"] for d in docs if d.get("scan_pages")]
+    out = [
+        "**知识库状态**",
+        f"- 文档数：{len(docs)}",
+        f"- 切片数：{stats['n_chunks']}",
+        f"- 平均切片长度：{stats['avg_chunk_len']:.0f} 字符",
+    ]
+    if scan_warnings:
+        out.append(f"- 扫描页警告：{len(scan_warnings)} 个文档")
+    out.append(f"- 自动改写阈值：score < {config.REWRITE_SCORE_THRESHOLD}")
+    return "\n".join(out)
+
+
+def _dispatch_query(platform: str, text: str, force_expand: bool) -> str:
     """
-    Run a query against the KB and return a Markdown reply.
-
-    Args:
-        platform: human label for the platform ('wecom' / 'dingtalk'); only
-                  used in the empty-KB help message.
-        raw_text: the user's message — typically their query string.
-                  Slash commands like `/help`, `/status`, `/expand` are
-                  handled here so both platforms share the same surface.
-
-    Returns:
-        A Markdown string safe to send back to the IM client.
+    Core query pipeline: BM25 → (optional) rewrite → re-search → render.
+    Pulled out of handle_message so the main function can wrap it with
+    a single record-last-reply call (no more "did I remember to record
+    at every return point?" footgun).
     """
-    text = (raw_text or "").strip()
-
-    # Slash commands — keep both platforms consistent.
-    if text in ("/help", "help", "?", "？"):
-        return (
-            "**AI Knowledge Cockpit · 帮助**\n\n"
-            "- 直接发送关键词，我会检索本地知识库并附来源\n"
-            "- 输入模糊、口语化也没事——我会在 BM25 弱命中时**自动用 LLM 改写 query** 再查\n"
-            "- 加 `/expand` 前缀强制改写（即使 BM25 强命中）\n"
-            "- `/status` 查看知识库统计\n"
-            "- `/help`  查看本帮助\n\n"
-            "**硬规则**：\n"
-            "- LLM 只用来改写 query，**绝不**生成答案\n"
-            "- 最终答案仍来自 KB 原文 + 来源标注\n"
-            "- 没找到就说没找到，不会编"
-        )
-    if text == "/status":
-        stats = storage.corpus_stats()
-        docs = storage.list_documents()
-        if not docs:
-            return "知识库为空。"
-        scan_warnings = [d["filename"] for d in docs if d.get("scan_pages")]
-        out = [
-            "**知识库状态**",
-            f"- 文档数：{len(docs)}",
-            f"- 切片数：{stats['n_chunks']}",
-            f"- 平均切片长度：{stats['avg_chunk_len']:.0f} 字符",
-        ]
-        if scan_warnings:
-            out.append(f"- 扫描页警告：{len(scan_warnings)} 个文档")
-        out.append(f"- 自动改写阈值：score < {config.REWRITE_SCORE_THRESHOLD}")
-        return "\n".join(out)
-
-    # /expand prefix — force LLM query rewrite, then search.
-    force_expand = False
-    if text.startswith("/expand "):
-        force_expand = True
-        text = text[len("/expand "):].strip()
-
-    if not text:
-        return "请发送需要检索的关键词，或输入 `/help` 查看帮助。"
-
     # Empty KB short-circuit.
     if not storage.list_documents():
         return _empty_help(platform)
@@ -236,6 +372,53 @@ def handle_message(platform: str, raw_text: str) -> str:
         return _format_hits_markdown(text, hits, weak=weak)
 
     return _no_hits(text)
+
+
+def handle_message(platform: str, raw_text: str, user_id: str = "") -> str:
+    """
+    Run a query against the KB and return a Markdown reply.
+
+    Args:
+        platform: human label for the platform ('wecom' / 'dingtalk' / 'feishu');
+                  only used in the empty-KB help message and feedback records.
+        raw_text: the user's message — typically their query string.
+                  Slash commands like `/help`, `/status`, `/expand`, `/good`,
+                  `/bad`, `/partial` are handled here so all platforms share
+                  the same surface.
+        user_id:  the platform's user ID (sender_id). Required for
+                  /good /bad /partial to work; can be empty for read-only
+                  queries (the bot will still answer, just can't accept
+                  feedback).
+
+    Returns:
+        A Markdown string safe to send back to the IM client.
+    """
+    text = (raw_text or "").strip()
+
+    # --- Slash commands — keep all platforms consistent. -----------------
+    if text in ("/help", "help", "?", "？"):
+        return _HELP_TEXT
+    if text == "/status":
+        return _status_text()
+    if text in ("/good", "/bad", "/partial"):
+        return _handle_feedback(platform, user_id, text[1:])
+
+    # /expand prefix — force LLM query rewrite, then search.
+    force_expand = False
+    if text.startswith("/expand "):
+        force_expand = True
+        text = text[len("/expand "):].strip()
+
+    if not text:
+        return "请发送需要检索的关键词，或输入 `/help` 查看帮助。"
+
+    # --- Main query dispatch. Record the reply for /good /bad /partial
+    # to attach to. Recording AFTER the reply is computed means the
+    # single record site covers every code path (including the empty
+    # short-circuit, the no-hits case, and the rewrite path). ---------
+    reply = _dispatch_query(platform, text, force_expand)
+    _record_last_reply(platform, user_id, text, reply, message_type="text")
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +593,7 @@ def _split_for_im(reply: str, max_len: int = 3800) -> list[str]:
     return final
 
 
-def handle_image(platform: str, image_path: str) -> str:
+def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     """
     Image input entry point (场景 2).
 
@@ -424,6 +607,12 @@ def handle_image(platform: str, image_path: str) -> str:
     Hard rule: the synth answer is NEVER trusted alone. The raw hits
     are always shown alongside so the user (or a maintainer) can verify
     every claim against the source KB content.
+
+    The reply is also recorded for /good /bad /partial feedback (the
+    user can rate whether the OCR + synth + retrieval pipeline worked
+    end-to-end). The question we record is the OCR'd text (truncated),
+    so the feedback file shows "user asked X about Y" — useful for
+    diagnosing OCR errors vs retrieval errors.
     """
     if not storage.list_documents():
         return _empty_help(platform)
@@ -431,33 +620,45 @@ def handle_image(platform: str, image_path: str) -> str:
     # 1. OCR / VL understanding of the image.
     extracted = image_extract.extract_text(image_path)
     if not extracted:
-        return (
+        reply = (
             "📷 图片识别失败,可能原因:\n"
             "- 格式不支持(支持 jpg / png / gif / webp)\n"
             "- VL 凭证缺失或网络错误\n"
             "- 图片中无文字\n\n"
             "请改用文字直接发送,或换张图重试。"
         )
+        _record_last_reply(
+            platform, user_id, "[image]", reply, message_type="image",
+        )
+        return reply
 
     # 2. BM25 search using the extracted text as the query.
     hits = search_mod.search(extracted, top_k=config.DEFAULT_TOP_K)
 
     # 3. LLM synthesis (the only place LLM is allowed to "answer").
     if not hits:
-        return _format_image_reply(
+        reply = _format_image_reply(
             extracted_text=extracted,
             synth_answer="",
             synth_used=False,
             hits=[],
         )
+        _record_last_reply(
+            platform, user_id, extracted[:200], reply, message_type="image",
+        )
+        return reply
 
     synth = answer_synth.synthesize(extracted, hits)
 
     # 4. Assemble reply — ALWAYS show the raw hits, even if synth was
     #    used. The user can ignore them, but they need to be visible.
-    return _format_image_reply(
+    reply = _format_image_reply(
         extracted_text=extracted,
         synth_answer=synth.answer,
         synth_used=synth.used_synth,
         hits=hits,
     )
+    _record_last_reply(
+        platform, user_id, extracted[:200], reply, message_type="image",
+    )
+    return reply

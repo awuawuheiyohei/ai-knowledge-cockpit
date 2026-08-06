@@ -211,7 +211,7 @@ def _handle_event(event: dict) -> None:
     if text:
         logger.info("feishu text chat=%s from=%s msg=%s: %r",
                     chat_type, sender_open, msg_id, text[:120])
-        reply = im_router.handle_message("feishu", text)
+        reply = im_router.handle_message("feishu", text, user_id=sender_open)
         receive_id, receive_id_type = _resolve_reply_target(event)
         try:
             _reply_text(cfg, receive_id, receive_id_type, reply)
@@ -231,7 +231,7 @@ def _handle_event(event: dict) -> None:
             fd, tmp_path = tempfile.mkstemp(prefix="kb_feishu_", suffix=ext)
             with os.fdopen(fd, "wb") as f:
                 f.write(image_bytes)
-            reply = im_router.handle_image("feishu", tmp_path)
+            reply = im_router.handle_image("feishu", tmp_path, user_id=sender_open)
         except Exception as e:
             logger.error("feishu image handling failed for msg=%s: %s", msg_id, e)
             reply = (

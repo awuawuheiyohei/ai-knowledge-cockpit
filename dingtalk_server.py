@@ -213,7 +213,8 @@ def _image_pipeline_thread(
             f.write(image_bytes)
 
         # 3. The actual KB pipeline: VL OCR → BM25 → optional LLM synth.
-        reply = handle_image("dingtalk", tmp_path)
+        user_id = getattr(incoming, "sender_id", "") or ""
+        reply = handle_image("dingtalk", tmp_path, user_id=user_id)
 
         # 4. DingTalk Markdown messages are silently truncated around
         #    ~4000 chars. Split long replies so the user sees everything.
@@ -273,6 +274,7 @@ class KBChatbotHandler:
                     incoming, "sender_id", "unknown"
                 )
                 msgtype = getattr(incoming, "message_type", "?")
+                user_id = getattr(incoming, "sender_id", "") or ""
 
                 # --- text branch (场景 1) ---
                 text = _extract_text(incoming)
@@ -280,7 +282,7 @@ class KBChatbotHandler:
                     handler_self._logger.info(
                         "DingTalk text from %s: %r", sender, text[:120],
                     )
-                    reply = handle_message("dingtalk", text)
+                    reply = handle_message("dingtalk", text, user_id=user_id)
                     _send_markdown(handler_self, self, incoming, reply)
                     return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
