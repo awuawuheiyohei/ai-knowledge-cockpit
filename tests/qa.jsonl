@@ -1,0 +1,9 @@
+{"question": "PKI 是什么", "expect_files_contains": ["OSG9", "OSG10"], "expect_min_score": 10.0, "category": "PKI"}
+{"question": "公钥基础设施", "expect_files_contains": ["OSG"], "expect_min_score": 30.0, "category": "PKI"}
+{"question": "数字证书", "expect_files_contains": ["OSG9", "OSG10"], "expect_min_score": 15.0, "category": "PKI"}
+{"question": "CIA 三元组", "expect_files_contains": ["OSG", "域1"], "expect_min_score": 20.0, "category": "基础概念"}
+{"question": "对称加密", "expect_files_contains": ["OSG", "域2", "域3"], "expect_min_score": 15.0, "category": "密码学"}
+{"question": "AES", "expect_files_contains": ["OSG", "域2", "域3"], "expect_min_score": 5.0, "category": "密码学"}
+{"question": "防火墙", "expect_files_contains": ["OSG", "域4", "域7"], "expect_min_score": 10.0, "category": "网络安全"}
+{"question": "HTTPS 加密", "expect_files_contains": ["OSG", "域4"], "expect_min_score": 8.0, "category": "网络安全"}
+{"question": "RBAC", "expect_files_contains": ["OSG", "域5"], "expect_min_score": 5.0, "category": "访问控制"}
