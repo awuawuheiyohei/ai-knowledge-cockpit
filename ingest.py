@@ -30,6 +30,7 @@ import chunks as chunker
 import bm25
 import pdf_extract
 import md_extract
+import sections
 import pdf_ocr
 import vl_config
 
@@ -144,28 +145,70 @@ def _ingest_pdf(file_path: Path, use_ocr: bool = False) -> IngestSummary:
         status = "ok"
 
     # Build chunks, attaching page_num + via_ocr per chunk.
+    # Day 2 (2026-08-06): when the PDF has a usable outline, we chunk
+    # section-by-section and prefix each chunk with its section heading
+    # so the chapter title becomes part of the indexable vocabulary.
+    # This dramatically improves "what does chapter X cover" queries
+    # that previously couldn't match because the chunk was a paragraph
+    # deep in the chapter (with the title nowhere nearby).
     chunk_records: list[dict] = []
     chunk_texts: list[str] = []
     char_count_total = 0
     next_idx = 0
-    for page in result.pages:
-        if page.is_scanned:
-            continue
-        text = page.text
-        if not text.strip():
-            continue
-        char_count_total += len(text)
-        for piece in chunker.chunk_text(text):
-            chunk_records.append(
-                {
-                    "chunk_index": next_idx,
-                    "page_num": page.page_num,
-                    "chunk_text": piece,
-                    "via_ocr": page.via_ocr,
-                }
-            )
-            chunk_texts.append(piece)
-            next_idx += 1
+
+    pdf_sections = sections.parse_pdf_sections(str(file_path))
+    if len(pdf_sections) == 1 and not pdf_sections[0].heading:
+        # No outline (or empty outline) — fall back to plain per-page
+        # chunking, exactly as before. No behavior change for these PDFs.
+        for page in result.pages:
+            if page.is_scanned:
+                continue
+            text = page.text
+            if not text.strip():
+                continue
+            char_count_total += len(text)
+            for piece in chunker.chunk_text(text):
+                chunk_records.append(
+                    {
+                        "chunk_index": next_idx,
+                        "page_num": page.page_num,
+                        "chunk_text": piece,
+                        "via_ocr": page.via_ocr,
+                    }
+                )
+                chunk_texts.append(piece)
+                next_idx += 1
+    else:
+        # Sectioned PDF — group pages by outline entry.
+        page_by_num = {p.page_num: p for p in result.pages}
+        last_page = max(page_by_num.keys()) if page_by_num else 0
+        for i, sec in enumerate(pdf_sections):
+            start = sec.page_num or 1
+            if i + 1 < len(pdf_sections):
+                next_start = pdf_sections[i + 1].page_num or (start + 1)
+                end = next_start - 1
+            else:
+                end = last_page
+            for pn in range(start, end + 1):
+                page = page_by_num.get(pn)
+                if page is None or page.is_scanned:
+                    continue
+                text = page.text
+                if not text.strip():
+                    continue
+                char_count_total += len(text)
+                for piece in chunker.chunk_text(text):
+                    piece_with_ctx = sections.prefix_chunk(piece, sec.heading)
+                    chunk_records.append(
+                        {
+                            "chunk_index": next_idx,
+                            "page_num": pn,
+                            "chunk_text": piece_with_ctx,
+                            "via_ocr": page.via_ocr,
+                        }
+                    )
+                    chunk_texts.append(piece_with_ctx)
+                    next_idx += 1
 
     if status == "failed" or not chunk_records:
         doc_id = storage.add_document(
@@ -255,15 +298,23 @@ def _ingest_markdown(file_path: Path) -> IngestSummary:
             message=f"Markdown read failed: {e}",
         )
 
-    chunk_texts = chunker.chunk_text(text)
-    chunk_records = [
-        {
-            "chunk_index": i,
-            "page_num": None,
-            "chunk_text": t,
-        }
-        for i, t in enumerate(chunk_texts)
-    ]
+    # Day 2 (2026-08-06): section-aware chunking. Each markdown
+    # section's chunks get the section heading prefixed so BM25 can
+    # match "what does <section name> cover" queries even when the
+    # chunk's body text doesn't include the heading.
+    chunk_records: list[dict] = []
+    chunk_texts: list[str] = []
+    next_idx = 0
+    for sec in sections.parse_markdown_sections(text):
+        for piece in chunker.chunk_text(sec.text):
+            piece_with_ctx = sections.prefix_chunk(piece, sec.heading)
+            chunk_records.append({
+                "chunk_index": next_idx,
+                "page_num": None,
+                "chunk_text": piece_with_ctx,
+            })
+            chunk_texts.append(piece_with_ctx)
+            next_idx += 1
 
     doc_id = storage.add_document(
         filename=file_path.name,
