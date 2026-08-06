@@ -18,6 +18,9 @@ inbox/
 # Local logs (OCR runs etc.)
 logs/
 
+# Embedding model cache (downloaded on first run, hundreds of MB)
+.cache/
+
 # IDE
 .idea/
 
