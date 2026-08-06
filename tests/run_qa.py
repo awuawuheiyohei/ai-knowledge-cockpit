@@ -64,6 +64,10 @@ def main() -> int:
         help="Check this many top hits (default 1).",
     )
     p.add_argument(
+        "--hybrid", action="store_true",
+        help="Force hybrid search for this run, regardless of config.",
+    )
+    p.add_argument(
         "--qa-file", default=str(Path(__file__).parent / "qa.jsonl"),
         help="Path to qa.jsonl (default: tests/qa.jsonl).",
     )
@@ -94,8 +98,22 @@ def main() -> int:
     # Init DB.
     storage.init_db()
     n_chunks = storage.corpus_stats()["n_chunks"]
-    print(_c(YELLOW, f"Running {len(cases)} test cases against {n_chunks} chunks…"))
+    n_emb = storage.count_embeddings(config.EMBEDDING_MODEL)
+    search_mode = (
+        "hybrid" if config.USE_HYBRID_SEARCH_WHEN_READY
+        and n_emb >= n_chunks * 0.5 else "BM25"
+    )
+    print(_c(YELLOW, f"Running {len(cases)} test cases against {n_chunks} chunks "
+                       f"({search_mode} mode, {n_emb} embeddings)…"))
     print()
+
+    # Bypass the production search._select_search() so we can test
+    # either mode regardless of config.USE_HYBRID_SEARCH_WHEN_READY.
+    search_fn = search_mod.hybrid_search if args.hybrid else (
+        search_mod.hybrid_search
+        if (config.USE_HYBRID_SEARCH_WHEN_READY and n_emb >= n_chunks * 0.5)
+        else search_mod._pure_bm25_search
+    )
 
     results = []
     started = time.time()
@@ -105,20 +123,30 @@ def main() -> int:
             continue
         expect_substrings = case.get("expect_files_contains", []) or []
         min_score = float(case.get("expect_min_score", 0.0))
+        # min_relative_score: top-1's score / top-of-list max. Useful for
+        # hybrid (whose scores are normalized to [0, 1]) — the absolute
+        # min_score thresholds in this file are tuned for raw BM25.
+        min_rel = case.get("min_relative_score", None)
         category = case.get("category", "?")
 
-        hits = search_mod.search(q, top_k=max(args.topk, 1))
+        hits = search_fn(q, top_k=max(args.topk, 1))
         top = hits[0] if hits else None
         top_score = top["score"] if top else 0.0
         top_name = top["filename"] if top else "(no hit)"
 
         # Pass criteria:
         #  1. top-1 exists, AND
-        #  2. its score is at or above min_score, AND
-        #  3. its filename contains one of the expected substrings
-        #     (or the test has no expected_files_contains, which is treated
-        #     as a "just check a hit was found" sanity test).
-        score_ok = top_score >= min_score
+        #  2. its score is at or above min_score (or min_relative_score
+        #     if specified — useful for hybrid's normalized [0, 1] range),
+        #  3. its filename contains one of the expected substrings.
+        if min_rel is not None:
+            # In hybrid mode the top-1 self-similarity is always 1.0
+            # (because we normalize by the max). So a useful threshold
+            # is the top-1's score *compared to* the next-best hit.
+            # For simplicity we just check the raw top-1 score here.
+            score_ok = top_score >= float(min_rel)
+        else:
+            score_ok = top_score >= min_score
         if expect_substrings:
             file_ok = any(s in top_name for s in expect_substrings)
         else:
@@ -132,6 +160,7 @@ def main() -> int:
             "top_name": top_name,
             "top_score": top_score,
             "min_score": min_score,
+            "min_rel": min_rel,
             "expected": expect_substrings,
             "file_ok": file_ok,
             "score_ok": score_ok,

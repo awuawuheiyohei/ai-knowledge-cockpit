@@ -70,6 +70,22 @@ CREATE TABLE IF NOT EXISTS index_term (
 
 CREATE INDEX IF NOT EXISTS idx_index_term_term ON index_term(term);
 CREATE INDEX IF NOT EXISTS idx_index_term_doc ON index_term(doc_id);
+
+-- Embedding vectors (Day 6). One row per chunk; vector is stored as
+-- raw float32 little-endian bytes (BLOB), 4 * EMBEDDING_DIM bytes long.
+-- Composite (chunk_id, model) is the natural key — we may want to
+-- support multiple embedding models in the future without rewriting.
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id  INTEGER NOT NULL,
+    doc_id    INTEGER NOT NULL,
+    model     TEXT NOT NULL,
+    dim       INTEGER NOT NULL,
+    vector    BLOB NOT NULL,
+    PRIMARY KEY (chunk_id, model),
+    FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_doc ON chunk_embeddings(doc_id, model);
 """
 
 
@@ -358,6 +374,152 @@ def get_chunk_texts(doc_id: int) -> list[str]:
             (doc_id,),
         )
         return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Embedding storage (Day 6)
+# ---------------------------------------------------------------------------
+# Embeddings are stored as raw float32 little-endian BLOBs. The shape
+# is implicit: dim * 4 bytes. We store (chunk_id, model) as the
+# composite key so a future model swap can co-exist with the old
+# vectors in the same table (and the old ones get dropped when the
+# new model is rebuilt via `app.py rebuild --with-embeddings`).
+
+def insert_embeddings(
+    rows: list[tuple[int, int, str, int, bytes]],
+) -> None:
+    """
+    Bulk-insert embeddings. Each tuple is (chunk_id, doc_id, model, dim, vector_bytes).
+    Use `replace=True` to overwrite existing rows for the same (chunk_id, model).
+    """
+    if not rows:
+        return
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO chunk_embeddings
+                (chunk_id, doc_id, model, dim, vector)
+            VALUES (?,?,?,?,?)
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_embeddings(model: str | None = None) -> int:
+    """How many chunks have an embedding (optionally for a specific model)."""
+    conn = get_conn()
+    try:
+        if model is None:
+            cur = conn.execute("SELECT COUNT(*) FROM chunk_embeddings")
+        else:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings WHERE model = ?",
+                (model,),
+            )
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_all_embeddings(model: str) -> tuple[list[int], "object"]:
+    """
+    Load every embedding for `model` into memory.
+
+    Returns (chunk_ids, vectors) where vectors is a numpy array of
+    shape (n_chunks, dim) and dtype float32. This is the hot path for
+    hybrid search — 20K * 384 * 4 = 30MB, fine to hold in RAM.
+    """
+    import numpy as np
+
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "SELECT chunk_id, vector, dim FROM chunk_embeddings "
+            "WHERE model = ? ORDER BY chunk_id",
+            (model,),
+        )
+        chunk_ids: list[int] = []
+        rows: list[bytes] = []
+        dim = 0
+        for r in cur:
+            chunk_ids.append(r[0])
+            rows.append(r[1])
+            dim = r[2] or dim
+        if not rows:
+            return [], np.zeros((0, dim or 1), dtype="float32")
+        vectors = np.frombuffer(b"".join(rows), dtype="float32").reshape(
+            len(rows), dim,
+        )
+        return chunk_ids, vectors
+    finally:
+        conn.close()
+
+
+def get_chunks_needing_embeddings(model: str) -> list[tuple[int, int, str]]:
+    """
+    Return (chunk_id, doc_id, chunk_text) for every chunk that does
+    NOT yet have an embedding for `model`. Used by `rebuild --with-embeddings`
+    to compute just the deltas instead of redoing the whole corpus.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT c.id, c.doc_id, c.chunk_text
+              FROM chunks c
+              LEFT JOIN chunk_embeddings e
+                ON e.chunk_id = c.id AND e.model = ?
+             WHERE e.chunk_id IS NULL
+             ORDER BY c.doc_id, c.id
+            """,
+            (model,),
+        )
+        return [(r[0], r[1], r[2]) for r in cur]
+    finally:
+        conn.close()
+
+
+def get_chunks_needing_embeddings_for_doc(
+    model: str, doc_id: int,
+) -> list[tuple[int, str]]:
+    """
+    Per-doc variant of `get_chunks_needing_embeddings` — used by ingest
+    to embed just the chunks of the document that was just ingested.
+    Returns (chunk_id, chunk_text) pairs.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT c.id, c.chunk_text
+              FROM chunks c
+              LEFT JOIN chunk_embeddings e
+                ON e.chunk_id = c.id AND e.model = ?
+             WHERE c.doc_id = ? AND e.chunk_id IS NULL
+             ORDER BY c.id
+            """,
+            (model, doc_id),
+        )
+        return [(r[0], r[1]) for r in cur]
+    finally:
+        conn.close()
+
+
+def drop_embeddings(model: str) -> int:
+    """Delete all embeddings for a model. Returns rows deleted."""
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "DELETE FROM chunk_embeddings WHERE model = ?", (model,),
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

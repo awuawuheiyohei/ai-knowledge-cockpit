@@ -54,6 +54,42 @@ class IngestSummary:
     message: str = ""
 
 
+def _embed_chunks_for_doc(doc_id: int) -> int:
+    """
+    Compute and store embedding vectors for all chunks of a single doc.
+
+    Best-effort: if the embedding model can't be loaded (network
+    issue, broken install), we log and return 0 — the chunks are
+    still searchable via BM25, just not via hybrid search.
+
+    Returns the number of embeddings written.
+    """
+    import embedding
+    import config
+
+    if not embedding.is_available():
+        return 0
+    # Fetch the (chunk_id, chunk_text) pairs for this doc, skipping
+    # any that already have an embedding (idempotent re-ingest).
+    pending = [
+        (cid, txt) for cid, txt in storage.get_chunks_needing_embeddings_for_doc(
+            config.EMBEDDING_MODEL, doc_id,
+        )
+    ]
+    if not pending:
+        return 0
+    texts = [txt for _, txt in pending]
+    vectors = embedding.embed_texts(texts, batch_size=64)
+    if vectors is None or len(vectors) == 0:
+        return 0
+    rows = [
+        (cid, doc_id, config.EMBEDDING_MODEL, vectors.shape[1], vectors[i].tobytes())
+        for i, (cid, _txt) in enumerate(pending)
+    ]
+    storage.insert_embeddings(rows)
+    return len(rows)
+
+
 def _file_hash(path: Path) -> str:
     """SHA1 of file bytes — fast dedupe key."""
     h = hashlib.sha1()
@@ -252,6 +288,12 @@ def _ingest_pdf(file_path: Path, use_ocr: bool = False) -> IngestSummary:
     storage.insert_chunks(doc_id, chunk_records)
     bm25.index_document(doc_id, chunk_texts)
 
+    # Day 6 (2026-08-06): also compute embedding vectors for the new
+    # chunks. Best-effort — if the model can't load (network / install
+    # issue) we just log and move on; search.hybrid_search will fall
+    # back to BM25 for these chunks.
+    _embed_chunks_for_doc(doc_id)
+
     return IngestSummary(
         file_path=str(file_path),
         filename=file_path.name,
@@ -328,6 +370,9 @@ def _ingest_markdown(file_path: Path) -> IngestSummary:
     )
     storage.insert_chunks(doc_id, chunk_records)
     bm25.index_document(doc_id, chunk_texts)
+
+    # Day 6: also compute embedding vectors for the new chunks.
+    _embed_chunks_for_doc(doc_id)
 
     return IngestSummary(
         file_path=str(file_path),

@@ -138,6 +138,31 @@ def cmd_search(args) -> int:
     return 0
 
 
+def cmd_search_hybrid(args) -> int:
+    """
+    Run the same query through the hybrid (BM25 + embedding) pipeline,
+    ignoring `USE_HYBRID_SEARCH_WHEN_READY`. Use this to A/B test
+    hybrid against pure BM25 (`search`) and decide whether to flip
+    the config flag.
+    """
+    storage.init_db()
+    if not storage.list_documents():
+        print("(no documents ingested yet — run `ingest` first)")
+        return 1
+    n_emb = storage.count_embeddings(config.EMBEDDING_MODEL)
+    if n_emb == 0:
+        print("(no embeddings — run `rebuild --with-embeddings` first)")
+        return 1
+    hits = search_mod.hybrid_search(
+        args.query, top_k=max(args.top * 3, 30),  # overfetch so doc filter still has hits
+    )
+    if args.doc:
+        hits = [h for h in hits if h["filename"] == args.doc]
+    hits = hits[: args.top]
+    search_mod.render(hits)
+    return 0
+
+
 def cmd_remove(args) -> int:
     storage.init_db()
     target = args.target
@@ -164,7 +189,15 @@ def cmd_rebuild(args) -> int:
 
     Use this if index stats get out of sync (rare, but possible if you
     poke the DB directly). Chunks and documents are preserved.
+
+    With --with-embeddings: also compute (or recompute) the embedding
+    vectors for every chunk. First run is slow (~30-60s for 20K chunks
+    on M-series CPU) because it downloads the sentence-transformer
+    model on first call; subsequent runs are deltas-only.
     """
+    import time
+    import embedding
+
     storage.init_db()
     conn = storage.get_conn()
     try:
@@ -185,7 +218,50 @@ def cmd_rebuild(args) -> int:
         if texts:
             bm25.index_document(d["id"], texts)
             rebuilt += 1
-    print(f"Rebuilt index for {rebuilt}/{len(docs)} document(s).")
+    print(f"Rebuilt BM25 index for {rebuilt}/{len(docs)} document(s).")
+
+    # Optional: rebuild embeddings too.
+    if args.with_embeddings:
+        if not embedding.is_available():
+            print("⚠️  Embedding model not loadable — skipping. "
+                  "(Check network + sentence-transformers install.)")
+            if embedding.last_load_error():
+                print(f"   last error: {embedding.last_load_error()}")
+            return 0
+
+        # Drop existing rows for this model so we get a clean rebuild.
+        if args.drop_embeddings:
+            n_drop = storage.drop_embeddings(config.EMBEDDING_MODEL)
+            print(f"Dropped {n_drop} old embeddings for {config.EMBEDDING_MODEL}.")
+
+        pending = storage.get_chunks_needing_embeddings(config.EMBEDDING_MODEL)
+        if not pending:
+            print(f"All chunks already have embeddings for {config.EMBEDDING_MODEL}.")
+            return 0
+
+        print(f"Computing embeddings for {len(pending)} chunks "
+              f"(model={config.EMBEDDING_MODEL})…")
+        t0 = time.time()
+        # Embed in batches so the encode() progress is bounded.
+        BATCH = 256
+        for i in range(0, len(pending), BATCH):
+            batch = pending[i:i + BATCH]
+            texts = [c[2] for c in batch]
+            vectors = embedding.embed_texts(texts, batch_size=64)
+            if vectors is None:
+                print(f"⚠️  embed_texts returned None at batch {i}; stopping.")
+                break
+            rows = [
+                (cid, did, config.EMBEDDING_MODEL, vectors.shape[1],
+                 vectors[j].tobytes())
+                for j, (cid, did, _txt) in enumerate(batch)
+            ]
+            storage.insert_embeddings(rows)
+            done = min(i + BATCH, len(pending))
+            print(f"  {done}/{len(pending)} embedded "
+                  f"({(time.time() - t0):.1f}s elapsed)")
+        total = time.time() - t0
+        print(f"Done. {len(pending)} embeddings stored in {total:.1f}s.")
     return 0
 
 
@@ -227,6 +303,19 @@ def cmd_status(args) -> int:
     print(f"Chunks         : {stats['n_chunks']}")
     print(f"Avg chunk len  : {stats['avg_chunk_len']:.1f} chars")
     print(f"Chunk size cfg : {config.CHUNK_SIZE} chars  (overlap {config.CHUNK_OVERLAP})")
+
+    # Embedding / hybrid-search status (Day 6).
+    try:
+        n_emb = storage.count_embeddings(config.EMBEDDING_MODEL)
+        if n_emb == 0:
+            print("Embeddings     : 0 (run `rebuild --with-embeddings` to enable hybrid search)")
+        elif n_emb < stats["n_chunks"]:
+            print(f"Embeddings     : {n_emb}/{stats['n_chunks']} "
+                  f"({100*n_emb//max(1,stats['n_chunks'])}%, partial — run `rebuild --with-embeddings`)")
+        else:
+            print(f"Embeddings     : {n_emb}/{stats['n_chunks']} (full, hybrid search active)")
+    except Exception as e:
+        print(f"Embeddings     : (error reading: {e})")
     if scan_warnings:
         print("Scan warnings  :")
         for fn, pages in scan_warnings:
@@ -388,11 +477,29 @@ def build_parser() -> argparse.ArgumentParser:
                           help="restrict to a single source filename")
     p_search.set_defaults(func=cmd_search)
 
+    p_search_hybrid = sub.add_parser(
+        "search-hybrid", help="hybrid BM25 + embedding search (A/B test against 'search')",
+    )
+    p_search_hybrid.add_argument("query", help="search query string")
+    p_search_hybrid.add_argument("--top", type=int, default=config.DEFAULT_TOP_K,
+                                 help=f"number of hits (default {config.DEFAULT_TOP_K}, max {config.MAX_TOP_K})")
+    p_search_hybrid.add_argument("--doc", default=None,
+                                 help="restrict to a single source filename")
+    p_search_hybrid.set_defaults(func=cmd_search_hybrid)
+
     p_remove = sub.add_parser("remove", help="remove a document by id or filename")
     p_remove.add_argument("target", help="document id or exact filename")
     p_remove.set_defaults(func=cmd_remove)
 
     p_rebuild = sub.add_parser("rebuild", help="rebuild the BM25 index from chunks")
+    p_rebuild.add_argument(
+        "--with-embeddings", action="store_true",
+        help="also (re)compute embedding vectors for hybrid search",
+    )
+    p_rebuild.add_argument(
+        "--drop-embeddings", action="store_true",
+        help="with --with-embeddings, drop existing rows first (clean rebuild)",
+    )
     p_rebuild.set_defaults(func=cmd_rebuild)
 
     p_status = sub.add_parser("status", help="show KB statistics")
