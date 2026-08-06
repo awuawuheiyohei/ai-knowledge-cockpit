@@ -408,7 +408,22 @@ def synthesize(question: str, hits: list[dict]) -> SynthResult:
 
     out_chars = len(raw)
     if not _is_valid_synthesis(raw, hits, question):
-        logger.warning("answer_synth: response failed citation check, falling back")
+        # Log a summary of the raw hits so the operator can see WHY
+        # the synth was rejected (helps tune the citation check or
+        # detect retrieval bugs that would otherwise be invisible
+        # because the user only sees the final reply).
+        if hits:
+            top3 = ", ".join(
+                f"{h.get('filename', '?')[:30]}:p.{h.get('page_num', '?')}={h.get('score', 0):.2f}"
+                for h in hits[:3]
+            )
+        else:
+            top3 = "(no BM25 hits)"
+        logger.warning(
+            "answer_synth: response failed citation check, falling back. "
+            "raw_hits=%d, top3=[%s]",
+            len(hits), top3,
+        )
         return SynthResult(
             answer=_EMPTY_ANSWER,
             used_synth=False,
