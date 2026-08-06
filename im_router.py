@@ -26,6 +26,7 @@ Two entry points
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime
 
@@ -37,6 +38,9 @@ import storage
 import query_rewrite
 import image_extract
 import answer_synth
+
+
+logger = logging.getLogger("im_router")
 
 
 def _empty_help(platform: str) -> str:
@@ -634,6 +638,21 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
 
     # 2. BM25 search using the extracted text as the query.
     hits = search_mod.search(extracted, top_k=config.DEFAULT_TOP_K)
+
+    # Log the top-3 hits for every image so the operator can see
+    # the retrieval quality regardless of whether synthesis passes
+    # or fails. Cheap (just one log line) and invaluable for tuning.
+    if hits:
+        top3 = ", ".join(
+            f"{h.get('filename', '?')[:30]}:p.{h.get('page_num', '?')}={h.get('score', 0):.2f}"
+            for h in hits[:3]
+        )
+        logger.info(
+            "image: BM25 top-3 hits (n=%d): [%s]",
+            len(hits), top3,
+        )
+    else:
+        logger.info("image: BM25 returned 0 hits")
 
     # 3. LLM synthesis (the only place LLM is allowed to "answer").
     if not hits:
