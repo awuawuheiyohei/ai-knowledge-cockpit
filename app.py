@@ -210,6 +210,11 @@ def cmd_rebuild(args) -> int:
     finally:
         conn.close()
 
+    # Optional: re-run the extract+chunk pipeline on every doc, so
+    # changes to chunks.py / pdf_extract.py / sections.py take effect.
+    if args.rechunk:
+        return cmd_rebuild_rechunk(args)
+
     # Re-index every document.
     docs = storage.list_documents()
     rebuilt = 0
@@ -262,6 +267,183 @@ def cmd_rebuild(args) -> int:
                   f"({(time.time() - t0):.1f}s elapsed)")
         total = time.time() - t0
         print(f"Done. {len(pending)} embeddings stored in {total:.1f}s.")
+    return 0
+
+
+def cmd_rebuild_rechunk(args) -> int:
+    """
+    Re-run the full extract+chunk pipeline on every document.
+
+    Use this after changing the chunker / PDF extractor / section
+    parser — the BM25 index and embedding table are still consistent
+    with the chunks table, but the chunks themselves are stale.
+
+    The original files are read from the `data/originals/` mirror
+    written by ingest. If a file is missing from the mirror, that
+    document is skipped (logged) and left as-is.
+
+    Implementation note: we can't just call `ingest._ingest_pdf` /
+    `_ingest_markdown` because they do a file-hash dedupe that
+    short-circuits re-chunking. Instead we inline the per-doc
+    extract + chunk + persist steps, leaving the `documents` row
+    intact (so doc_id stays the same and downstream indexes don't
+    need to be re-keyed).
+    """
+    import time
+    import ingest
+    import bm25
+    import embedding
+    import paths
+    import pdf_extract
+    import md_extract
+    import chunks as chunker
+    import sections
+
+    storage.init_db()
+    docs = storage.list_documents()
+    if not docs:
+        print("(no documents — nothing to rechunk)")
+        return 0
+
+    # Drop ALL chunks + embeddings + index (rebuild from scratch).
+    conn = storage.get_conn()
+    try:
+        conn.execute("DELETE FROM index_term")
+        conn.execute("DELETE FROM chunk_embeddings")
+        conn.execute("DELETE FROM chunks")
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"Cleared all chunks/embeddings/index for {len(docs)} docs.")
+
+    started = time.time()
+    ok = 0
+    skipped = 0
+
+    for d in docs:
+        rel = d["relative_path"]
+        src = paths.BASE / rel
+        if not src.is_file():
+            print(f"  skip {d['filename']}: original not found at {src}")
+            skipped += 1
+            continue
+        doc_id = d["id"]
+        try:
+            if d["source_type"] == "pdf":
+                result = pdf_extract.extract_pdf(str(src))
+                non_scan = [p for p in result.pages if not p.is_scanned]
+                # Reuse the existing section-aware chunker logic from
+                # ingest._ingest_pdf (copy it inline so we don't trigger
+                # the hash-dedupe short-circuit).
+                pdf_secs = sections.parse_pdf_sections(str(src))
+                chunk_records: list[dict] = []
+                chunk_texts: list[str] = []
+                char_count_total = 0
+                next_idx = 0
+                page_by_num = {p.page_num: p for p in result.pages}
+                last_page = max(page_by_num.keys()) if page_by_num else 0
+                if len(pdf_secs) == 1 and not pdf_secs[0].heading:
+                    for page in result.pages:
+                        if page.is_scanned:
+                            continue
+                        text = page.text
+                        if not text.strip():
+                            continue
+                        char_count_total += len(text)
+                        for piece in chunker.chunk_text(text):
+                            chunk_records.append({
+                                "chunk_index": next_idx,
+                                "page_num": page.page_num,
+                                "chunk_text": piece,
+                                "via_ocr": page.via_ocr,
+                            })
+                            chunk_texts.append(piece)
+                            next_idx += 1
+                else:
+                    for i, sec in enumerate(pdf_secs):
+                        start = sec.page_num or 1
+                        if i + 1 < len(pdf_secs):
+                            next_start = pdf_secs[i + 1].page_num or (start + 1)
+                            end = next_start - 1
+                        else:
+                            end = last_page
+                        for pn in range(start, end + 1):
+                            page = page_by_num.get(pn)
+                            if page is None or page.is_scanned:
+                                continue
+                            text = page.text
+                            if not text.strip():
+                                continue
+                            char_count_total += len(text)
+                            for piece in chunker.chunk_text(text):
+                                piece_with_ctx = sections.prefix_chunk(piece, sec.heading)
+                                chunk_records.append({
+                                    "chunk_index": next_idx,
+                                    "page_num": pn,
+                                    "chunk_text": piece_with_ctx,
+                                    "via_ocr": page.via_ocr,
+                                })
+                                chunk_texts.append(piece_with_ctx)
+                                next_idx += 1
+                if not chunk_records:
+                    skipped += 1
+                    print(f"  rechunk {d['filename']}: no text extracted")
+                    continue
+            else:
+                # Markdown
+                text, char_count = md_extract.read_markdown(str(src))
+                chunk_records = []
+                chunk_texts = []
+                next_idx = 0
+                for sec in sections.parse_markdown_sections(text):
+                    for piece in chunker.chunk_text(sec.text):
+                        piece_with_ctx = sections.prefix_chunk(piece, sec.heading)
+                        chunk_records.append({
+                            "chunk_index": next_idx,
+                            "page_num": None,
+                            "chunk_text": piece_with_ctx,
+                        })
+                        chunk_texts.append(piece_with_ctx)
+                        next_idx += 1
+                if not chunk_records:
+                    skipped += 1
+                    print(f"  rechunk {d['filename']}: empty markdown")
+                    continue
+
+            storage.insert_chunks(doc_id, chunk_records)
+            bm25.index_document(doc_id, chunk_texts)
+            ok += 1
+            print(f"  [{ok:3d}/{len(docs)}] {d['filename']}  →  "
+                  f"{len(chunk_records)} chunks")
+        except Exception as e:
+            skipped += 1
+            print(f"  rechunk {d['filename']}: {type(e).__name__}: {e}")
+    elapsed = time.time() - started
+
+    # Re-compute embeddings for everything that needs them.
+    if args.with_embeddings and embedding.is_available():
+        pending = storage.get_chunks_needing_embeddings(config.EMBEDDING_MODEL)
+        if pending:
+            print(f"Computing embeddings for {len(pending)} rechunked chunks…")
+            for i in range(0, len(pending), 256):
+                batch = pending[i:i + 256]
+                texts = [c[2] for c in batch]
+                vectors = embedding.embed_texts(texts, batch_size=64)
+                if vectors is None:
+                    break
+                rows = [
+                    (cid, did, config.EMBEDDING_MODEL, vectors.shape[1],
+                     vectors[j].tobytes())
+                    for j, (cid, did, _txt) in enumerate(batch)
+                ]
+                storage.insert_embeddings(rows)
+                done = min(i + 256, len(pending))
+                print(f"  embeddings: {done}/{len(pending)}")
+
+    new_stats = storage.corpus_stats()
+    print(f"Rechunked {ok}/{len(docs)} documents "
+          f"({skipped} skipped) in {elapsed:.1f}s. "
+          f"New total: {new_stats['n_chunks']} chunks.")
     return 0
 
 
@@ -499,6 +681,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_rebuild.add_argument(
         "--drop-embeddings", action="store_true",
         help="with --with-embeddings, drop existing rows first (clean rebuild)",
+    )
+    p_rebuild.add_argument(
+        "--rechunk", action="store_true",
+        help="re-run extract + chunk on every document (applies any "
+             "changes to chunks.py / pdf_extract.py / sections.py). "
+             "Drops and regenerates all chunks + embeddings.",
     )
     p_rebuild.set_defaults(func=cmd_rebuild)
 

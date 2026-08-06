@@ -100,11 +100,19 @@ def _file_hash(path: Path) -> str:
 
 
 def _mirror_original(src: Path) -> str:
-    """Copy the source file into data/originals/. Returns the relative path."""
+    """
+    Copy the source file into data/originals/. Returns the relative path.
+
+    If `src` is already inside data/originals/ (e.g. we're re-chunking
+    from a `--rechunk` rebuild), the copy is a no-op and we just
+    return the path. This avoids `shutil.SameFileError` from copy2.
+    """
     paths.ensure_dirs()
     dest_dir = paths.ORIGINALS / src.stem
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name
+    if src.resolve() == dest.resolve():
+        return str(dest.relative_to(paths.BASE))
     shutil.copy2(src, dest)
     return str(dest.relative_to(paths.BASE))
 
