@@ -321,7 +321,22 @@ def delete_document(doc_id: int) -> None:
     try:
         conn.execute("DELETE FROM index_term WHERE doc_id = ?", (doc_id,))
         conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+        conn.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
         conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_chunks_for_doc(doc_id: int) -> None:
+    """Delete just the chunks + index + embeddings for a doc. Useful
+    for `--rechunk` rebuilds where the documents row stays but the
+    chunks need to be regenerated under a new chunking scheme."""
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM index_term WHERE doc_id = ?", (doc_id,))
+        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+        conn.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
         conn.commit()
     finally:
         conn.close()
