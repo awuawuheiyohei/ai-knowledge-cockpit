@@ -182,32 +182,22 @@ def _extract_text_layout_aware(page) -> str:
         # Plain text is already in good order; cheap fast path.
         return page.get_text("text") or ""
 
-    # For "two-col" and "mixed", force the left-then-right column
-    # order. Full-width blocks (figures spanning both columns) get
-    # floated to the top in their original y order so they don't end
-    # up stranded in the middle of a column.
-    mid = width / 2
-    left: list = []
-    right: list = []
-    full_width: list = []
-    for b in blocks:
-        x_center = (b[0] + b[2]) / 2
-        if b[0] < 60 and b[2] > width - 30:
-            # Block spans essentially the full page width.
-            full_width.append(b)
-        elif x_center < mid:
-            left.append(b)
-        else:
-            right.append(b)
-
-    # Within a column, sort by y. Round y to 2px to group together a
-    # heading and the first line of its body.
-    left.sort(key=lambda b: (round(b[1] / 2) * 2, b[0]))
-    right.sort(key=lambda b: (round(b[1] / 2) * 2, b[0]))
-    full_width.sort(key=lambda b: b[1])
-
-    parts = [b[4].strip() for b in full_width + left + right]
-    return "\n\n".join(p for p in parts if p)
+    # For "two-col" and "mixed" layouts, fall back to pymupdf's
+    # own "text" mode. Our earlier hand-rolled left/right/full-width
+    # split (2026-08-06) was supposed to do a better job than
+    # pymupdf, but in practice it *garbled* reading order on
+    # borderline pages (OSG9 page 100/220/320) where a paragraph
+    # wraps across the page mid-line — the wrapped lines landed
+    # in the wrong column. pymupdf's text mode does its own
+    # physical-block walk and handles those cases correctly.
+    #
+    # This means layout-aware extraction now provides a small
+    # speedup (avoid the per-block bookkeeping) and a *correctness*
+    # improvement (no more garbled outputs) but no semantic
+    # restructuring — pymupdf alone is good enough for our
+    # retrieval purposes. Day 3's other contribution — fixing
+    # "looks-like-scanned" detection — is unaffected.
+    return page.get_text("text") or ""
 
 
 def _looks_like_scanned(text: str) -> bool:
