@@ -320,6 +320,27 @@ def cmd_rebuild_rechunk(args) -> int:
     ok = 0
     skipped = 0
 
+    # If the source has ocr_pages set, we MUST re-OCR — these pages
+    # are scans with no text layer; the default extract path returns
+    # empty text. We dispatch to a path that supplies an OCR
+    # callback so the re-ingest is faithful to the original.
+    import vl_config
+    import pdf_ocr
+    cfg = None
+    ocr_needed = any(
+        d.get("ocr_pages") and d["ocr_pages"] != "[]"
+        for d in docs if d["source_type"] == "pdf"
+    )
+    if ocr_needed:
+        try:
+            cfg = vl_config.load_vl_config()
+            print(f"OCR: VL config OK (model={cfg.model}). "
+                  f"Will re-OCR any docs that need it.")
+        except Exception as e:
+            print(f"⚠️  OCR-needed docs present but VL config unavailable: {e}")
+            print("    Will skip OCR'd docs unless you set VL_API_KEY.")
+            cfg = None
+
     for d in docs:
         rel = d["relative_path"]
         src = paths.BASE / rel
@@ -328,9 +349,21 @@ def cmd_rebuild_rechunk(args) -> int:
             skipped += 1
             continue
         doc_id = d["id"]
+        # Build per-doc OCR callback if this is an OCR'd doc.
+        ocr_callback = None
+        if (
+            d["source_type"] == "pdf"
+            and d.get("ocr_pages")
+            and d["ocr_pages"] != "[]"
+            and cfg is not None
+        ):
+            ocr_usage = pdf_ocr.OcrUsage()
+            def _cb(page, page_num, _cfg=cfg, _u=ocr_usage):
+                return pdf_ocr.ocr_page(page, page_num, _cfg, _u)
+            ocr_callback = _cb
         try:
             if d["source_type"] == "pdf":
-                result = pdf_extract.extract_pdf(str(src))
+                result = pdf_extract.extract_pdf(str(src), ocr_callback=ocr_callback)
                 non_scan = [p for p in result.pages if not p.is_scanned]
                 # Reuse the existing section-aware chunker logic from
                 # ingest._ingest_pdf (copy it inline so we don't trigger
