@@ -27,3 +27,9 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+exam/sqlite/*.sqlite
+exam/exam.sqlite
+exam/exam.sqlite-journal
+exam/exam.sqlite-shm
+exam/exam.sqlite-wal
+data/reextracted/

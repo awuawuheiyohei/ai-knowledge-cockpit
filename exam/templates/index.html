@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>刷题</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --fg: #e6e8eb;
+    --muted: #9aa3ad;
+    --accent: #6ea8ff;
+    --correct: #4ade80;
+    --wrong: #f87171;
+    --card: #1a1d24;
+    --border: #2a2f3a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "SF Pro SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 24px;
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 16px; }
+  .stats {
+    display: flex; gap: 24px; padding: 12px 16px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 16px;
+    font-size: 14px; color: var(--muted);
+  }
+  .stats span { color: var(--fg); font-weight: 600; }
+  .toolbar {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;
+  }
+  button {
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--border); padding: 8px 14px;
+    border-radius: 6px; cursor: pointer; font-size: 14px;
+  }
+  button:hover { border-color: var(--accent); }
+  button.active { background: var(--accent); color: #000; border-color: var(--accent); }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px; margin-bottom: 16px;
+  }
+  .q-meta { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .q-text {
+    font-size: 16px; line-height: 1.7;
+    white-space: pre-wrap; margin-bottom: 16px;
+  }
+  .option {
+    display: block; width: 100%; text-align: left;
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); padding: 12px 16px;
+    border-radius: 6px; cursor: pointer; margin-bottom: 8px;
+    font-size: 14px; line-height: 1.6;
+  }
+  .option:hover { border-color: var(--accent); }
+  .option.selected { background: var(--accent); color: #000; border-color: var(--accent); }
+  .option.correct { background: var(--correct); color: #000; border-color: var(--correct); }
+  .option.wrong { background: var(--wrong); color: #fff; border-color: var(--wrong); }
+  .feedback {
+    margin-top: 12px; padding: 12px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--border);
+    font-size: 14px; line-height: 1.6;
+  }
+  .feedback.correct { border-color: var(--correct); }
+  .feedback.wrong { border-color: var(--wrong); }
+  .explanation {
+    margin-top: 12px; padding: 12px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; font-size: 13px; line-height: 1.6;
+    white-space: pre-wrap; max-height: 240px; overflow-y: auto;
+  }
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<h1>📚 刷题</h1>
+
+<div class="stats" id="stats">加载中…</div>
+
+<div class="toolbar">
+  <button id="btn-random" class="active">🎲 随机</button>
+  <button id="btn-wrong">❌ 错题本</button>
+  <select id="doc-filter" style="background: var(--card); color: var(--fg); border: 1px solid var(--border); padding: 8px 12px; border-radius: 6px; font-size: 14px;">
+    <option value="">所有来源</option>
+  </select>
+</div>
+
+<div class="card" id="card">
+  <div class="empty">点上面的按钮开始</div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+let currentQuestion = null;
+let currentMode = 'random';
+let selected = new Set();
+
+async function loadStats() {
+  const r = await fetch('/api/stats');
+  const s = await r.json();
+  $('#stats').innerHTML = `
+    做题: <span>${s.total_attempts}</span> ·
+    正确: <span>${s.correct}</span> ·
+    正确率: <span>${(s.accuracy * 100).toFixed(1)}%</span> ·
+    错题: <span>${s.wrong_count}</span>
+  `;
+}
+
+async function loadDocs() {
+  // We don't have a /api/docs endpoint, so just list the 4 sets hardcoded
+  const docs = ['综合测试一.pdf', '综合测试二.pdf', '综合测试三.pdf', '综合测试四.pdf'];
+  const sel = $('#doc-filter');
+  for (const d of docs) {
+    const opt = document.createElement('option');
+    opt.value = d; opt.textContent = d.replace('.pdf', '');
+    sel.appendChild(opt);
+  }
+}
+
+async function nextQuestion() {
+  const doc = $('#doc-filter').value;
+  const params = new URLSearchParams({ mode: currentMode });
+  if (doc) params.set('doc', doc);
+  const r = await fetch('/api/question?' + params);
+  if (r.status === 404) {
+    $('#card').innerHTML = `<div class="empty">${
+      currentMode === 'wrong' ? '错题本空空的 🎉' : '没有题目匹配'
+    }</div>`;
+    return;
+  }
+  const q = await r.json();
+  currentQuestion = q;
+  selected.clear();
+  renderQuestion(q);
+}
+
+function renderQuestion(q) {
+  const isMulti = q.qtype === 'multi';
+  $('#card').innerHTML = `
+    <div class="q-meta">
+      ${q.source_doc.replace('.pdf', '')} · #${q.qnum} · ${isMulti ? '多选题' : '单选题'} ·
+      知识点: ${q.knowledge_point || '未匹配'}
+    </div>
+    <div class="q-text">${escapeHtml(q.question)}</div>
+    <div id="opts">
+      ${q.options.map(o => `
+        <button class="option" data-letter="${o.letter}">
+          <strong>${o.letter}.</strong> ${escapeHtml(o.text)}
+        </button>
+      `).join('')}
+    </div>
+    <div class="actions">
+      <button id="submit">提交</button>
+      <button id="skip">跳过</button>
+    </div>
+    <div id="feedback"></div>
+  `;
+  $$('.option').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const l = btn.dataset.letter;
+      if (isMulti) {
+        if (selected.has(l)) selected.delete(l);
+        else selected.add(l);
+        btn.classList.toggle('selected');
+      } else {
+        selected.clear();
+        selected.add(l);
+        $$('.option').forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+      }
+    });
+  });
+  $('#submit').addEventListener('click', submit);
+  $('#skip').addEventListener('click', nextQuestion);
+}
+
+async function submit() {
+  if (!currentQuestion) return;
+  if (selected.size === 0) {
+    alert('选一个答案再提交');
+    return;
+  }
+  const r = await fetch('/api/answer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      question_id: currentQuestion.id,
+      user_answer: Array.from(selected).join(''),
+    }),
+  });
+  const data = await r.json();
+  showFeedback(data);
+  loadStats();
+}
+
+function showFeedback(data) {
+  // Mark options
+  const correctSet = new Set(data.correct_answer.split(''));
+  $$('.option').forEach(btn => {
+    const l = btn.dataset.letter;
+    if (correctSet.has(l)) btn.classList.add('correct');
+    else if (selected.has(l)) btn.classList.add('wrong');
+    btn.disabled = true;
+  });
+  const fbClass = data.correct ? 'correct' : 'wrong';
+  const fbText = data.correct ? '✅ 正确' : `❌ 答错 · 正确答案: ${data.correct_answer}`;
+  let html = `<div class="feedback ${fbClass}">${fbText}</div>`;
+  if (data.explanation) {
+    html += `<div class="explanation">${escapeHtml(data.explanation)}</div>`;
+  }
+  if (data.kb_link) {
+    html += `<div class="explanation">
+      <strong>知识点:</strong> ${data.knowledge_point || '未匹配'}<br>
+      <a href="${data.kb_link}" target="_blank">📖 在 KB 里搜这道题</a>
+    </div>`;
+  }
+  if (!data.correct) {
+    html += `<div class="actions">
+      <button id="master">标为已掌握</button>
+      <button id="next">下一题</button>
+    </div>`;
+    setTimeout(() => {
+      const m = $('#master');
+      if (m) m.addEventListener('click', async () => {
+        await fetch('/api/mastered', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question_id: currentQuestion.id }),
+        });
+        loadStats();
+        nextQuestion();
+      });
+      const n = $('#next');
+      if (n) n.addEventListener('click', nextQuestion);
+    }, 0);
+  } else {
+    html += `<div class="actions"><button id="next">下一题</button></div>`;
+    setTimeout(() => {
+      const n = $('#next');
+      if (n) n.addEventListener('click', nextQuestion);
+    }, 0);
+  }
+  $('#feedback').innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+$('#btn-random').addEventListener('click', () => {
+  currentMode = 'random';
+  $$('.toolbar button').forEach(b => b.classList.remove('active'));
+  $('#btn-random').classList.add('active');
+  nextQuestion();
+});
+$('#btn-wrong').addEventListener('click', () => {
+  currentMode = 'wrong';
+  $$('.toolbar button').forEach(b => b.classList.remove('active'));
+  $('#btn-wrong').classList.add('active');
+  nextQuestion();
+});
+$('#doc-filter').addEventListener('change', () => {
+  if (currentQuestion) nextQuestion();
+});
+
+loadStats();
+loadDocs();
+nextQuestion();
+</script>
+</body>
+</html>
