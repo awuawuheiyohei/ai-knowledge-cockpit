@@ -213,6 +213,12 @@ def cmd_rebuild(args) -> int:
     # Optional: re-run the extract+chunk pipeline on every doc, so
     # changes to chunks.py / pdf_extract.py / sections.py take effect.
     if args.rechunk:
+        if args.only_ocr:
+            # Strip non-OCR docs from the work list. We re-load the
+            # list here because the original `docs` variable above
+            # was the FULL list; cmd_rebuild_rechunk does its own
+            # list_documents() so we just narrow via a kwarg.
+            pass  # handled inside cmd_rebuild_rechunk
         return cmd_rebuild_rechunk(args)
 
     # Re-index every document.
@@ -300,21 +306,53 @@ def cmd_rebuild_rechunk(args) -> int:
     import sections
 
     storage.init_db()
-    docs = storage.list_documents()
-    if not docs:
+    all_docs = storage.list_documents()
+    if not all_docs:
         print("(no documents — nothing to rechunk)")
         return 0
+    # If --only-ocr, narrow to docs that have ocr_pages set.
+    if getattr(args, "only_ocr", False):
+        import json as _json
+        docs = [
+            d for d in all_docs
+            if d.get("ocr_pages") and d["ocr_pages"] != "[]"
+        ]
+        skipped = len(all_docs) - len(docs)
+        print(f"--only-ocr: skipping {skipped} non-OCR docs, "
+              f"processing {len(docs)} OCR doc(s).")
+    else:
+        docs = all_docs
 
-    # Drop ALL chunks + embeddings + index (rebuild from scratch).
+    # If --doc is given, narrow to that one filename.
+    if getattr(args, "doc", None):
+        wanted = args.doc
+        docs = [d for d in docs if d["filename"] == wanted or d["relative_path"] == wanted]
+        if not docs:
+            print(f"--doc {wanted!r}: no matching document found")
+            return 1
+        print(f"--doc: narrowed to {len(docs)} doc(s) matching {wanted!r}.")
+
+    no_clear = getattr(args, "no_clear", False)
+    # Drop ALL chunks + embeddings + index (rebuild from scratch) —
+    # unless --no-clear is set (per-doc restart-safe mode).
     conn = storage.get_conn()
     try:
-        conn.execute("DELETE FROM index_term")
-        conn.execute("DELETE FROM chunk_embeddings")
-        conn.execute("DELETE FROM chunks")
-        conn.commit()
+        if no_clear:
+            # Only drop the chunks for the docs we're about to process.
+            for d in docs:
+                conn.execute("DELETE FROM index_term WHERE doc_id = ?", (d["id"],))
+                conn.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (d["id"],))
+                conn.execute("DELETE FROM chunks WHERE doc_id = ?", (d["id"],))
+            conn.commit()
+            print(f"Cleared chunks/embeddings/index for {len(docs)} target doc(s) (no-clear mode).")
+        else:
+            conn.execute("DELETE FROM index_term")
+            conn.execute("DELETE FROM chunk_embeddings")
+            conn.execute("DELETE FROM chunks")
+            conn.commit()
+            print(f"Cleared all chunks/embeddings/index for {len(docs)} docs.")
     finally:
         conn.close()
-    print(f"Cleared all chunks/embeddings/index for {len(docs)} docs.")
 
     started = time.time()
     ok = 0
@@ -720,6 +758,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-run extract + chunk on every document (applies any "
              "changes to chunks.py / pdf_extract.py / sections.py). "
              "Drops and regenerates all chunks + embeddings.",
+    )
+    p_rebuild.add_argument(
+        "--only-ocr", action="store_true",
+        help="with --rechunk: skip non-OCR documents (useful when "
+             "OSG10/9-style giant PDFs block the rebuild). "
+             "OCR'd docs (ocr_pages != '[]') are still re-extracted "
+             "and re-chunked via the OCR callback.",
+    )
+    p_rebuild.add_argument(
+        "--doc", default=None,
+        help="with --rechunk: only process this filename (e.g. 'foo.pdf'). "
+             "Use with --no-clear for restart-safe per-doc rebuilds.",
+    )
+    p_rebuild.add_argument(
+        "--no-clear", action="store_true",
+        help="with --rechunk: only delete chunks/embeddings for the docs "
+             "being processed, not the whole corpus. Use with --doc for "
+             "restart-safe per-doc rebuilds that survive a process crash.",
     )
     p_rebuild.set_defaults(func=cmd_rebuild)
 
