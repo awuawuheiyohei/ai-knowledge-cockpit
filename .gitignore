@@ -1,35 +1,46 @@
-# Environment
+# --- Environment & secrets ---
 .env
 .env.*
 
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Data & generated outputs
+# --- Data & generated outputs ---
 data/
 
 # Source PDFs (large binary files) — personal / copyrighted material, never push
 raw/*.pdf
 inbox/
 
-# Local logs (OCR runs etc.)
+# Local logs (OCR runs, bot output, etc.)
 logs/
 
 # Embedding model cache (downloaded on first run, hundreds of MB)
 .cache/
 
-# IDE
-.idea/
+# OCR re-extraction intermediate files
+data/reextracted/
 
-# OS
+# Exam app runtime state
+exam/exam.sqlite
+exam/exam.sqlite-*
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- OS ---
 .DS_Store
 Thumbs.db
-exam/sqlite/*.sqlite
-exam/exam.sqlite
-exam/exam.sqlite-journal
-exam/exam.sqlite-shm
-exam/exam.sqlite-wal
-data/reextracted/
+
+# --- Build / packaging ---
+dist/
+build/
+*.egg

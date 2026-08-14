@@ -1,0 +1,9 @@
+# Development / CI dependencies.
+# Production deps live in requirements.txt.
+#
+# Currently we rely on the stdlib `unittest` for tests, so this file is
+# intentionally minimal. Add tools here as we adopt them (e.g. coverage,
+# ruff, mypy).
+
+# Coverage reporting
+coverage>=7.0

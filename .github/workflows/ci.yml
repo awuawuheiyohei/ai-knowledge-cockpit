@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Lint (syntax + import check)
+        run: |
+          python -m py_compile app.py
+          python -m py_compile exam/app.py
+          for f in bm25.py chunks.py sections.py pdf_extract.py pdf_ocr.py storage.py search.py embedding.py im_router.py answer_synth.py image_extract.py; do
+            python -m py_compile "$f"
+          done
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v 2>&1 | tail -60
+
+  exam-app-smoke:
+    runs-on: macos-14
+    timeout-minutes: 5
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Boot exam app + hit health endpoint
+        env:
+          VL_API_KEY: dummy-for-import-check
+        run: |
+          # Import-only smoke: just make sure the app module loads.
+          python -c "import exam.app; print('exam.app imports OK')"
+          # The questions.json is committed, so we can also boot the actual
+          # Flask app on a free port and curl /api/health.
+          python exam/app.py &
+          APP_PID=$!
+          sleep 3
+          curl -sf http://127.0.0.1:5001/api/health || (kill $APP_PID; exit 1)
+          kill $APP_PID

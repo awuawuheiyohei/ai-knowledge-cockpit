@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Full unit test suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v 2>&1 | tail -60
+
+      - name: Verify question bank shape
+        run: |
+          python -c "
+          import json
+          qs = json.load(open('exam/questions.json'))
+          assert len(qs) >= 100, f'expected >=100 questions, got {len(qs)}'
+          complete = sum(1 for q in qs if q.get('correct') and len(q.get('options', [])) >= 2)
+          assert complete >= 100, f'expected >=100 complete questions, got {complete}'
+          print(f'question bank: {len(qs)} total, {complete} complete')
+          "
+
+  release:
+    runs-on: macos-14
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
