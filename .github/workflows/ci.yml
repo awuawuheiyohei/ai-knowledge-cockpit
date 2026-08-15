@@ -61,12 +61,19 @@ jobs:
           pip install pip-audit
 
       - name: Run pip-audit (vulnerability scan)
-        # Strict mode: fail on any known CVE in the dependency tree.
-        # We tolerate high-severity findings for now (continue-on-error)
-        # because most CVEs are in transitive deps with no actual
-        # exploit path in this app. Flip to `rm` if you want a hard gate.
+        # Hard gate: any known CVE fails the build. Force upgrade in PR.
+        # To silence temporarily, set IGNORE_CVES in the step env.
+        env:
+          # Comma-separated list of PYSEC-IDs to ignore, e.g. PYSEC-2026-2253
+          IGNORE_CVES: ""
         run: |
-          pip-audit --strict --disable-pip 2>&1 | tail -80 || echo "::warning::pip-audit found vulnerabilities, see log"
+          AUDIT_ARGS="--strict --disable-pip"
+          if [ -n "$IGNORE_CVES" ]; then
+            for cve in $(echo "$IGNORE_CVES" | tr ',' ' '); do
+              AUDIT_ARGS="$AUDIT_ARGS --ignore-vuln $cve"
+            done
+          fi
+          pip-audit $AUDIT_ARGS 2>&1 | tail -80
 
   exam-app-smoke:
     runs-on: macos-14
