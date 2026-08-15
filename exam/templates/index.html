@@ -189,22 +189,35 @@ async function submit() {
     alert('选一个答案再提交');
     return;
   }
-  const r = await fetch('/api/answer', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      question_id: currentQuestion.id,
-      user_answer: Array.from(selected).join(''),
-    }),
-  });
-  const data = await r.json();
-  showFeedback(data);
-  loadStats();
+  try {
+    const r = await fetch('/api/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question_id: currentQuestion.id,
+        user_answer: Array.from(selected).join(''),
+      }),
+    });
+    if (!r.ok) {
+      const errText = await r.text();
+      $('#feedback').innerHTML = `<div class="feedback wrong">提交失败: HTTP ${r.status}<br>${escapeHtml(errText)}</div>`;
+      return;
+    }
+    const data = await r.json();
+    showFeedback(data);
+    loadStats();
+  } catch (e) {
+    $('#feedback').innerHTML = `<div class="feedback wrong">提交异常: ${escapeHtml(String(e))}</div>`;
+  }
 }
 
 function showFeedback(data) {
   // Mark options
-  const correctSet = new Set(data.correct_answer.split(''));
+  // data.correct_answer may arrive as a string ("A") or an array (["A","C"])
+  const correctArr = Array.isArray(data.correct_answer)
+    ? data.correct_answer
+    : [data.correct_answer];
+  const correctSet = new Set(correctArr);
   $$('.option').forEach(btn => {
     const l = btn.dataset.letter;
     if (correctSet.has(l)) btn.classList.add('correct');
@@ -212,7 +225,8 @@ function showFeedback(data) {
     btn.disabled = true;
   });
   const fbClass = data.correct ? 'correct' : 'wrong';
-  const fbText = data.correct ? '✅ 正确' : `❌ 答错 · 正确答案: ${data.correct_answer}`;
+  const correctStr = correctArr.join('');
+  const fbText = data.correct ? '✅ 正确' : `❌ 答错 · 正确答案: ${correctStr}`;
   let html = `<div class="feedback ${fbClass}">${fbText}</div>`;
   if (data.explanation) {
     html += `<div class="explanation">${escapeHtml(data.explanation)}</div>`;

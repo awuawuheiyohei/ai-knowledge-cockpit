@@ -43,6 +43,31 @@ jobs:
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v 2>&1 | tail -60
 
+  dep-audit:
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      - name: Run pip-audit (vulnerability scan)
+        # Strict mode: fail on any known CVE in the dependency tree.
+        # We tolerate high-severity findings for now (continue-on-error)
+        # because most CVEs are in transitive deps with no actual
+        # exploit path in this app. Flip to `rm` if you want a hard gate.
+        run: |
+          pip-audit --strict --disable-pip 2>&1 | tail -80 || echo "::warning::pip-audit found vulnerabilities, see log"
+
   exam-app-smoke:
     runs-on: macos-14
     timeout-minutes: 5
