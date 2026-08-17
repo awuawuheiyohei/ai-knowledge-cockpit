@@ -568,13 +568,26 @@ def corpus_stats() -> dict:
     try:
         n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         if n_chunks == 0:
-            return {"n_docs": 0, "n_chunks": 0, "avg_chunk_len": 1.0}
+            return {"n_docs": 0, "n_chunks": 0, "avg_chunk_len": 1.0,
+                    "n_index_terms": 0}
         avg_len = conn.execute("SELECT AVG(LENGTH(chunk_text)) FROM chunks").fetchone()[0] or 1.0
         n_docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        n_index_terms = conn.execute("SELECT COUNT(*) FROM index_term").fetchone()[0]
         return {
             "n_docs": n_docs,
             "n_chunks": n_chunks,
             "avg_chunk_len": max(1.0, float(avg_len)),
+            "n_index_terms": n_index_terms,
         }
+    finally:
+        conn.close()
+
+
+def count_index_terms() -> int:
+    """Return the row count of the BM25 inverted index. Used by callers
+    to detect a degraded/empty index without doing a full rebuild."""
+    conn = get_conn()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM index_term").fetchone()[0]
     finally:
         conn.close()

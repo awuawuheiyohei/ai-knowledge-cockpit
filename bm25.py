@@ -113,6 +113,34 @@ def remove_document_from_index(doc_id: int) -> None:
         conn.close()
 
 
+def rebuild_index() -> int:
+    """
+    Wipe and rebuild the entire BM25 inverted index from the chunks table.
+
+    Use this when the index gets out of sync with chunks (e.g. a partial
+    rebuild left it nearly empty). Idempotent and safe to run any time;
+    chunks are never touched.
+
+    Returns the number of docs re-indexed.
+    """
+    import storage
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM index_term")
+        conn.commit()
+    finally:
+        conn.close()
+
+    docs = storage.list_documents()
+    n_indexed = 0
+    for d in docs:
+        chunks = storage.get_chunk_texts(d["id"])
+        if chunks:
+            index_document(d["id"], chunks)
+            n_indexed += 1
+    return n_indexed
+
+
 # ---------------------------------------------------------------------------
 # BM25 scoring
 # ---------------------------------------------------------------------------

@@ -515,6 +515,16 @@ def cmd_rebuild_rechunk(args) -> int:
     print(f"Rechunked {ok}/{len(docs)} documents "
           f"({skipped} skipped) in {elapsed:.1f}s. "
           f"New total: {new_stats['n_chunks']} chunks.")
+
+    # Defensive: rebuild the BM25 inverted index after rechunk.
+    # We have observed cases where --no-clear mode left the index in a
+    # partial state (very few terms) even though chunks looked correct.
+    # This step is idempotent and runs in O(chunks); ~5-30s for 20K chunks.
+    if not getattr(args, "skip_index_rebuild", False):
+        print("Rebuilding BM25 index (defensive)…")
+        bm25.rebuild_index()
+        n_terms = storage.count_index_terms()
+        print(f"  index_terms: {n_terms}")
     return 0
 
 
@@ -556,6 +566,14 @@ def cmd_status(args) -> int:
     print(f"Chunks         : {stats['n_chunks']}")
     print(f"Avg chunk len  : {stats['avg_chunk_len']:.1f} chars")
     print(f"Chunk size cfg : {config.CHUNK_SIZE} chars  (overlap {config.CHUNK_OVERLAP})")
+    # BM25 inverted-index health. If this is ~0 while chunks > 0, the
+    # index is degraded — run `app.py rebuild` (no args) to fix.
+    n_terms = stats.get("n_index_terms", 0)
+    if stats["n_chunks"] > 0 and n_terms < 1000:
+        flag = " ⚠️  DEGRADED — run `app.py rebuild` to fix"
+    else:
+        flag = ""
+    print(f"Index terms    : {n_terms}{flag}")
 
     # Embedding / hybrid-search status (Day 6).
     try:
