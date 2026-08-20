@@ -373,9 +373,37 @@ def run(app_key: Optional[str] = None, app_secret: Optional[str] = None) -> None
 
     # start_forever() blocks and handles KeyboardInterrupt internally.
     # We just wrap it so the "stopped" log line shows up cleanly on Ctrl+C.
+    #
+    # Also start a background heartbeat thread so the external watchdog
+    # (tools/watch_bot.sh) can tell a *silent-but-healthy* bot apart
+    # from a stuck one. The SDK is otherwise silent when the WebSocket
+    # is in a happy state, so without a heartbeat a long idle period
+    # looks identical to a frozen event loop.
+    import threading
+    import time
+    from pathlib import Path
+
+    HEARTBEAT_PATH = Path("/tmp/dingtalk_bot.alive")
+
+    def _heartbeat_loop() -> None:
+        while True:
+            try:
+                HEARTBEAT_PATH.touch()
+            except Exception:
+                pass
+            time.sleep(20)
+
+    t = threading.Thread(target=_heartbeat_loop, name="bot-heartbeat", daemon=True)
+    t.start()
+    HEARTBEAT_PATH.touch()  # immediate first touch
+
     try:
         client.start_forever()
     finally:
+        try:
+            HEARTBEAT_PATH.unlink()
+        except FileNotFoundError:
+            pass
         logger.info("DingTalk bot stopped.")
 
 
