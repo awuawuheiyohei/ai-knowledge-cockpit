@@ -17,12 +17,19 @@ set -e
 
 EN0_GW="${EN0_GW:-192.168.43.117}"
 
-# Aliyun ranges covering api.dingtalk.com and wss-open-connection-union.dingtalk.com
+# Aliyun /8 ranges covering all observed DingTalk API + WSS endpoint IPs.
+# We use /8 instead of /16 because the WSS endpoint IP rotates across many
+# Aliyun allocations (47.x, 106.x, 39.x, etc.) and we can't predict which
+# one the server will return. /8 routes for the three Aliyun /8s cover
+# essentially all of Aliyun Cloud.
 # Resolved via DoH (1.1.1.1 / dns.alidns.com) on 2026-08-26.
+#
+# Trade-off: any Aliyun Cloud service traffic (OSS/RDS/etc., if you use them)
+# also bypasses the VPN. Acceptable for a personal-use bot.
 NETS=(
-  "47.246.0.0/16"   # Aliyun international — api.dingtalk.com, wss endpoint
-  "47.92.0.0/16"    # Aliyun international — wss endpoint alternate
-  "106.11.0.0/16"   # Aliyun domestic — api.dingtalk.com alternate
+  "39.0.0.0/8"      # Aliyun Cloud (e.g. 39.99.237.196 — observed WSS endpoint)
+  "47.0.0.0/8"      # Aliyun international (e.g. 47.246.x.x — api.dingtalk.com)
+  "106.0.0.0/8"     # Aliyun domestic (e.g. 106.11.x.x — api.dingtalk.com alternate)
 )
 
 # Idempotent route-add:
