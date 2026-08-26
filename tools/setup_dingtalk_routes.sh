@@ -11,7 +11,7 @@
 # bypasses the VPN. For a personal-use machine this is usually fine.
 #
 # Run as root via launchd (com.mavis.dingtalk-bypass.plist).
-# Idempotent: safe to re-run.
+# Idempotent: safe to re-run (skips nets that already have a non-TUN route).
 
 set -e
 
@@ -25,10 +25,28 @@ NETS=(
   "106.11.0.0/16"   # Aliyun domestic — api.dingtalk.com alternate
 )
 
-# Idempotent route-add: ignore "File exists" errors
+# Idempotent route-add:
+# `route -n get <net>` answers "what route would this packet use?" — wrong.
+# We need to ask "is <net> itself a route entry, and does it NOT point to utun98?"
+# Use `route -n show <net>` and grep for the exact destination + utun98 absence.
+is_already_bypassing_tun() {
+  local net="$1"
+  local show_output
+  show_output="$(route -n show "$net" 2>/dev/null || true)"
+  # Look for a line starting with the network address pointing somewhere other than utun98.
+  # `route show` output format: "<net>          <gateway>     <flags>      <interface>"
+  if echo "$show_output" | grep -qE "^${net//./\\.}\s.*\s\S+\s*$"; then
+    # Found a row for this net. Check it doesn't go to utun98.
+    if echo "$show_output" | grep -v "utun98" | grep -q "^${net//./\\.}"; then
+      return 0  # already bypassing TUN
+    fi
+  fi
+  return 1  # not present, or still on utun98
+}
+
 for net in "${NETS[@]}"; do
-  if route -n get "$net" >/dev/null 2>&1; then
-    echo "[skip] $net already routed"
+  if is_already_bypassing_tun "$net"; then
+    echo "[skip] $net already bypasses TUN"
   else
     if route -n add -net "$net" "$EN0_GW" 2>&1; then
       echo "[ok]   $net -> $EN0_GW (en0, bypass TUN)"
