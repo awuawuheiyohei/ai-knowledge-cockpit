@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mavis.dingtalk-bypass</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/tools/setup_dingtalk_routes.sh</string>
+  </array>
+
+  <!-- Run once at boot/login. The script is idempotent. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Don't keep the process alive — it's a one-shot setup. -->
+  <key>LaunchOnlyOnce</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/logs/dingtalk-bypass.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jiangwenrui/Downloads/mass/ai_knowledge_cockpit/logs/dingtalk-bypass.err.log</string>
+</dict>
+</plist>

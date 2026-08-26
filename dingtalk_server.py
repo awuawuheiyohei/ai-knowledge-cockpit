@@ -47,6 +47,10 @@ from typing import Optional
 
 import requests
 
+# Patch DNS BEFORE importing the DingTalk SDK, so *.dingtalk.com lookups
+# resolve to real IPs via DoH instead of iKuuuVPN's hijacked fake-IP DNS.
+import dingtalk_dns_patch  # noqa: F401
+
 import paths  # noqa: F401  — ensure dirs exist on import
 import storage
 import im_router
