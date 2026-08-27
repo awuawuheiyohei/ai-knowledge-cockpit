@@ -397,9 +397,77 @@ def run(app_key: Optional[str] = None, app_secret: Optional[str] = None) -> None
                 pass
             time.sleep(20)
 
+    # WS health monitor — kills the process if the SDK has been stuck in
+    # retry hell for too long. launchd (KeepAlive={Crashed: true}) then
+    # restarts the bot, which often unsticks a flaky VPN/TUN upstream.
+    #
+    # The SDK's stderr is the only reliable signal of WS liveness we can
+    # reach from a separate thread: a healthy bot either gets a new
+    # `endpoint is` line on each reconnect OR writes a `DingTalk text/
+    # picture from` line on each message. If neither appears in
+    # WS_STUCK_THRESHOLD_SEC, the SDK is in a failed-retry loop and
+    # bouncing the process is the cheapest fix.
+    import re
+    from datetime import datetime
+    import os
+
+    WS_STUCK_THRESHOLD_SEC = 300  # 5 min
+
+    def _ws_health_monitor() -> None:
+        err_log = Path(__file__).parent / "logs" / "dingtalk_bot.err.log"
+        # Wait a bit for the SDK to log its first 'endpoint is' before
+        # we start judging it.
+        time.sleep(60)
+        while True:
+            time.sleep(30)
+            try:
+                if not err_log.exists():
+                    continue
+                cutoff = time.time() - WS_STUCK_THRESHOLD_SEC
+                with open(err_log) as f:
+                    lines = f.readlines()
+                # Only inspect the tail — older lines aren't relevant.
+                recent = lines[-300:]
+                has_endpoint = False
+                has_message = False
+                for line in recent:
+                    m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                    if not m:
+                        continue
+                    try:
+                        ts = datetime.strptime(
+                            m.group(1), "%Y-%m-%d %H:%M:%S"
+                        ).timestamp()
+                    except ValueError:
+                        continue
+                    if ts < cutoff:
+                        continue
+                    if "endpoint is" in line:
+                        has_endpoint = True
+                        break
+                    if "DingTalk text from" in line or "DingTalk picture from" in line:
+                        has_message = True
+                        # don't break — a newer endpoint is more authoritative
+                if has_endpoint or has_message:
+                    continue
+                logger.error(
+                    "WS health monitor: no endpoint or message in last %ds; "
+                    "exiting to trigger launchd restart.",
+                    WS_STUCK_THRESHOLD_SEC,
+                )
+                # Give the log a moment to flush, then hard-exit.
+                time.sleep(1)
+                os._exit(1)
+            except Exception as e:
+                logger.debug("ws health monitor error: %s", e)
+
     t = threading.Thread(target=_heartbeat_loop, name="bot-heartbeat", daemon=True)
     t.start()
     HEARTBEAT_PATH.touch()  # immediate first touch
+
+    t2 = threading.Thread(target=_ws_health_monitor, name="ws-health-monitor", daemon=True)
+    t2.start()
+    logger.info("WS health monitor started (threshold %ds)", WS_STUCK_THRESHOLD_SEC)
 
     try:
         client.start_forever()
