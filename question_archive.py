@@ -125,11 +125,16 @@ def save_question(
         # already archived — don't write a duplicate file
         # (find the existing file for path reporting)
         existing = _find_existing_file(en_text, domain)
+        # Re-translate so the reply still shows 中文 even on dedup.
+        # Cheap (one LLM call) and the user always wants the translation
+        # in the chat reply, not just in the file.
+        zh_text_dedup = _translate_to_chinese(en_text)
         return {
             "path": existing,
             "is_new": False,
             "domain": domain,
             "domain_name": DOMAIN_NAMES[domain],
+            "zh_text": zh_text_dedup,
         }
 
     # 2. translate (best effort — empty string is acceptable; the .md
@@ -158,6 +163,7 @@ def save_question(
         "is_new": True,
         "domain": domain,
         "domain_name": domain_name,
+        "zh_text": zh_text,
     }
 
 

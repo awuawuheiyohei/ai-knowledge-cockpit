@@ -708,6 +708,8 @@ def _format_practice_reply(
       1. Domain tag (域N · 中文名) + archive state
       2. The English question the bot extracted (so the user can sanity
          check the OCR before they start working on the saved file)
+      3. The Chinese translation the bot archived (so the user can
+         read it in-chat without opening the saved file)
     """
     lines: list[str] = []
     if domain is not None and domain_name:
@@ -731,11 +733,23 @@ def _format_practice_reply(
     snippet = extracted_text.strip().replace("\n", " ")
     if len(snippet) > 800:
         snippet = snippet[:800].rstrip() + "…"
-    lines.append("### 📷 识别的内容")
+    lines.append("### 📷 英文原题")
     lines.append(f"> {snippet or '_(空)_'}")
     lines.append("")
+
+    zh_text = (archive_result.get("zh_text") or "").strip()
+    if zh_text:
+        lines.append("### 🀄 中文翻译")
+        # Same 800-char cap on the in-chat snippet so we don't blow past
+        # the IM message size limit on long questions.
+        zh_snippet = zh_text.replace("\n", " ")
+        if len(zh_snippet) > 800:
+            zh_snippet = zh_snippet[:800].rstrip() + "…"
+        lines.append(f"> {zh_snippet}")
+        lines.append("")
+
     lines.append("---")
-    lines.append("_已存档到上面的文件,自行练习(中文翻译在文件里)。不发答案。_")
+    lines.append("_已存档,自行练习(不发答案)。完整中文在文件里。_")
     return "\n".join(lines)
 
 
