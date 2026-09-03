@@ -436,19 +436,29 @@ def _format_image_reply(
     synth_answer: str,
     synth_used: bool,
     hits: list[dict],
+    domain: int | None = None,
+    domain_name: str | None = None,
+    archived_new: bool = False,
 ) -> str:
     """
     Build a Markdown reply for an image input.
 
     Layout (always shown, even on failure):
-      1. The text the VL model extracted from the image (truncated).
-      2. The LLM synthesis (if valid), or the standard "未检索到" line.
-      3. The raw BM25 hits (DEDUPED by content fingerprint) so the user
-         can always cross-check the synthesis against source material,
-         without seeing the same question 4 times because of overlapping
-         chunks.
+      1. Domain tag (域N · 中文名) if classification succeeded — also
+         a small archive marker if the question was newly archived.
+      2. The text the VL model extracted from the image (truncated).
+      3. The LLM synthesis (if valid), or the standard "未检索到" line.
+      4. The raw BM25 hits (DEDUPED by content fingerprint) so the user
+         can always cross-check the synthesis against source material.
     """
     lines: list[str] = []
+    if domain is not None and domain_name:
+        archive_note = " · 已归档" if archived_new else " · (已存在)"
+        lines.append(f"### 🏷️ 域{domain} · {domain_name}{archive_note}")
+    else:
+        lines.append("### 🏷️ 域:_(未识别)_")
+    lines.append("")
+
     lines.append("### 📷 识别的内容")
     snippet = extracted_text.strip().replace("\n", " ")
     if len(snippet) > 600:
@@ -597,16 +607,106 @@ def _split_for_im(reply: str, max_len: int = 3800) -> list[str]:
     return final
 
 
+# ---------------------------------------------------------------------------
+# Domain classification (added 2026-09-03)
+# ---------------------------------------------------------------------------
+
+_DOMAIN_NAMES: dict[int, str] = {
+    1: "安全与风险管理",
+    2: "资产安全",
+    3: "安全架构与工程",
+    4: "通信与网络安全",
+    5: "身份与访问管理",
+    6: "安全评估与测试",
+    7: "安全运营",
+    8: "软件开发安全",
+}
+
+
+def _classify_domain_via_llm(text: str) -> int | None:
+    """Ask the configured LLM to map an English CISSP question to one
+    of the 8 domains. Returns 1..8 or None on any failure.
+
+    Why a separate LLM call instead of keyword matching: questions are
+    paraphrased and cover many sub-topics; a small classifier prompt
+    generalizes better than hand-tuned rules. We reuse the same Anthropic
+    client + config as answer_synth so no new credentials needed.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        import llm_config
+        import anthropic
+    except ImportError:
+        return None
+    if not llm_config.is_llm_configured():
+        return None
+    try:
+        cfg = llm_config.load_llm_config()
+        client = anthropic.Anthropic(
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            timeout=cfg.timeout_s,
+            max_retries=0,
+        )
+        domain_list = "\n".join(f"{n}. {name}" for n, name in _DOMAIN_NAMES.items())
+        resp = client.messages.create(
+            model=cfg.model,
+            max_tokens=8,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "你是一个 CISSP 题目分类器。下面是 8 个域:\n"
+                    f"{domain_list}\n\n"
+                    "阅读用户给出的英文题目,只回复一个 1-8 的数字,"
+                    "代表这道题最相关的域。不要任何解释、标点、换行。\n\n"
+                    f"题目:\n{text[:1500]}"
+                ),
+            }],
+        )
+        # Concatenate all text blocks defensively.
+        out = "".join(
+            getattr(b, "text", "")
+            for b in resp.content
+            if getattr(b, "type", None) == "text"
+        ).strip()
+        # Pick the first digit 1-8 we see.
+        for ch in out:
+            if ch in "12345678":
+                return int(ch)
+        logger.info("classify_domain: LLM returned no digit, raw=%r", out[:60])
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("classify_domain failed: %s", e)
+        return None
+
+
+def _archive_if_new(question_text: str, domain: int | None, source: str) -> tuple[int | None, bool]:
+    """Archive the (English) question text. Returns (row_id_or_none, archived_bool).
+    - row_id_or_none: the new id if newly inserted, None if already existed
+    - archived_bool: True if we actually inserted (False if dedup or no domain)
+    """
+    if domain is None or not question_text.strip():
+        return None, False
+    try:
+        row_id = storage.archive_question(question_text, domain, source)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("archive_question failed: %s", e)
+        return None, False
+    return row_id, row_id is not None
+
+
 def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     """
     Image input entry point (场景 2).
 
     Pipeline:
       1. image_extract.extract_text()  → user's question as text
-      2. search.search(question)       → top-K BM25 hits
-      3. answer_synth.synthesize(...)  → LLM summary, with mandatory
-         `[来源: ...]` citation per claim, OR "未在资料中检索到"
-      4. Format Markdown reply with: extracted text + synth + raw hits
+      2. classify_domain(text)         → CISSP domain 1..8 (best effort)
+      3. archive_question(...)         → persist if new (best effort)
+      4. search.search(question)       → top-K BM25 hits
+      5. answer_synth.synthesize(...)  → LLM bilingual summary
+      6. Format Markdown reply with: extracted text + domain tag + synth + raw hits
 
     Hard rule: the synth answer is NEVER trusted alone. The raw hits
     are always shown alongside so the user (or a maintainer) can verify
@@ -636,7 +736,26 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
         )
         return reply
 
-    # 2. BM25 search using the extracted text as the query.
+    # 2. Classify the question into one of the 8 CISSP domains
+    #    (best effort — LLM call may fail or be unconfigured).
+    domain = _classify_domain_via_llm(extracted)
+    domain_name = _DOMAIN_NAMES.get(domain) if domain else None
+    if domain is None:
+        logger.info("image: domain classification skipped/failed")
+
+    # 3. Archive the question (best effort — duplicates are silently
+    #    ignored, failures are logged but don't break the user flow).
+    source = f"{platform}:{user_id}" if user_id else platform
+    _archived_id, archived_new = _archive_if_new(extracted, domain, source)
+    if archived_new:
+        logger.info(
+            "image: archived question id=%d domain=%s (%s)",
+            _archived_id, domain, domain_name,
+        )
+    elif domain is not None:
+        logger.info("image: question already in archive (domain=%s)", domain)
+
+    # 4. BM25 search using the extracted text as the query.
     hits = search_mod.search(extracted, top_k=config.DEFAULT_TOP_K)
 
     # Log the top-3 hits for every image so the operator can see
@@ -661,6 +780,9 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
             synth_answer="",
             synth_used=False,
             hits=[],
+            domain=domain,
+            domain_name=domain_name,
+            archived_new=archived_new,
         )
         _record_last_reply(
             platform, user_id, extracted[:200], reply, message_type="image",
@@ -676,6 +798,9 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
         synth_answer=synth.answer,
         synth_used=synth.used_synth,
         hits=hits,
+        domain=domain,
+        domain_name=domain_name,
+        archived_new=archived_new,
     )
     _record_last_reply(
         platform, user_id, extracted[:200], reply, message_type="image",

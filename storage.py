@@ -21,6 +21,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterable
 
 from paths import DB_PATH, ensure_dirs
@@ -86,6 +87,24 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_doc ON chunk_embeddings(doc_id, model);
+
+-- Question archive (added 2026-09-03 for the bilingual study flow):
+-- user pastes an English CISSP question via image, we OCR it, classify
+-- it to one of the 8 domains, and persist the (English) question text
+-- so the user can review by domain later. No answer is stored here
+-- on purpose: the user wants to read the Chinese reference answer
+-- they got from the bot and reconstruct it themselves.
+CREATE TABLE IF NOT EXISTS archived_questions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_text TEXT NOT NULL UNIQUE,   -- normalized; dedup key
+    domain        INTEGER NOT NULL,        -- 1..8 (CISSP domains)
+    domain_name   TEXT NOT NULL,           -- e.g. "通信与网络安全" (cached for display)
+    source        TEXT NOT NULL,            -- e.g. "dingtalk:user_id" or "manual"
+    created_at    TEXT NOT NULL            -- ISO timestamp
+);
+
+CREATE INDEX IF NOT EXISTS idx_archived_questions_domain ON archived_questions(domain);
+CREATE INDEX IF NOT EXISTS idx_archived_questions_created_at ON archived_questions(created_at);
 """
 
 
@@ -589,5 +608,108 @@ def count_index_terms() -> int:
     conn = get_conn()
     try:
         return conn.execute("SELECT COUNT(*) FROM index_term").fetchone()[0]
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------------------------
+# archived_questions CRUD (added 2026-09-03)
+# ---------------------------------------------------------------------------
+
+CISSP_DOMAIN_NAMES: dict[int, str] = {
+    1: "安全与风险管理",
+    2: "资产安全",
+    3: "安全架构与工程",
+    4: "通信与网络安全",
+    5: "身份与访问管理",
+    6: "安全评估与测试",
+    7: "安全运营",
+    8: "软件开发安全",
+}
+
+
+def _normalize_question(text: str) -> str:
+    """Lowercase + collapse whitespace + trim. Used as the dedup key
+    so re-pasting the same question is idempotent."""
+    return " ".join(text.lower().split())
+
+
+def archive_question(
+    question_text: str,
+    domain: int,
+    source: str,
+) -> int | None:
+    """Insert a question if not already archived. Returns:
+    - newly inserted question's id
+    - None if the question already exists (dedup hit, no insert)
+
+    The caller treats None as "already had it" and the row id as "new".
+    domain must be 1..8; the caller is responsible for the classification
+    (we don't want to call an LLM from this data layer).
+    """
+    text = (question_text or "").strip()
+    if not text:
+        return None
+    if domain not in CISSP_DOMAIN_NAMES:
+        raise ValueError(f"domain must be 1..8, got {domain}")
+    norm = _normalize_question(text)
+    domain_name = CISSP_DOMAIN_NAMES[domain]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    conn = get_conn()
+    try:
+        with tx(conn):
+            cur = conn.execute(
+                "SELECT id FROM archived_questions WHERE question_text = ?",
+                (norm,),
+            ).fetchone()
+            if cur is not None:
+                return None
+            cur = conn.execute(
+                "INSERT INTO archived_questions "
+                "(question_text, domain, domain_name, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (norm, domain, domain_name, source, now),
+            )
+            return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def list_archived_questions(
+    domain: int | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent archived questions, newest first. Optionally
+    filter by domain (1..8). Each row: id, question_text, domain,
+    domain_name, source, created_at."""
+    conn = get_conn()
+    try:
+        if domain is not None:
+            rows = conn.execute(
+                "SELECT id, question_text, domain, domain_name, source, created_at "
+                "FROM archived_questions WHERE domain = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (domain, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, question_text, domain, domain_name, source, created_at "
+                "FROM archived_questions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_archived_questions(domain: int | None = None) -> int:
+    conn = get_conn()
+    try:
+        if domain is not None:
+            return conn.execute(
+                "SELECT COUNT(*) FROM archived_questions WHERE domain = ?",
+                (domain,),
+            ).fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM archived_questions").fetchone()[0]
     finally:
         conn.close()
