@@ -696,31 +696,71 @@ def _archive_if_new(question_text: str, domain: int | None, source: str) -> tupl
     return row_id, row_id is not None
 
 
+def _format_practice_reply(
+    extracted_text: str,
+    domain: int | None,
+    domain_name: str | None,
+    archive_result: dict,
+) -> str:
+    """Reply shown in the IM for the practice (no-answer) flow.
+
+    Layout (kept minimal — the user wants to do the question themselves):
+      1. Domain tag (域N · 中文名) + archive state
+      2. The English question the bot extracted (so the user can sanity
+         check the OCR before they start working on the saved file)
+    """
+    lines: list[str] = []
+    if domain is not None and domain_name:
+        if archive_result.get("is_new"):
+            archive_note = "已归档"
+        elif archive_result.get("path"):
+            archive_note = "已存在(未重复保存)"
+        else:
+            archive_note = "归档失败(LLM 不可用?)"
+        lines.append(f"### 🏷️ 域{domain} · {domain_name} · {archive_note}")
+    else:
+        lines.append("### 🏷️ 域:_(未识别)_")
+    lines.append("")
+
+    # Show the file path so the user can find it on disk.
+    path = archive_result.get("path")
+    if path:
+        lines.append(f"📁 `{path}`")
+        lines.append("")
+
+    snippet = extracted_text.strip().replace("\n", " ")
+    if len(snippet) > 800:
+        snippet = snippet[:800].rstrip() + "…"
+    lines.append("### 📷 识别的内容")
+    lines.append(f"> {snippet or '_(空)_'}")
+    lines.append("")
+    lines.append("---")
+    lines.append("_已存档到上面的文件,自行练习(中文翻译在文件里)。不发答案。_")
+    return "\n".join(lines)
+
+
 def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     """
-    Image input entry point (场景 2).
+    Image input entry point (场景 2 — practice mode, 2026-09-03 redesign).
+
+    The user does NOT want the bot to give the answer. They want to
+    self-study: read the English question, attempt it themselves, then
+    verify against the Chinese translation that the bot archived.
 
     Pipeline:
       1. image_extract.extract_text()  → user's question as text
       2. classify_domain(text)         → CISSP domain 1..8 (best effort)
-      3. archive_question(...)         → persist if new (best effort)
-      4. search.search(question)       → top-K BM25 hits
-      5. answer_synth.synthesize(...)  → LLM bilingual summary
-      6. Format Markdown reply with: extracted text + domain tag + synth + raw hits
+      3. question_archive.save_question → write data/questions/域N/<ts>-<hash>.md
+                                          with English + Chinese translation,
+                                          dedup by normalized text
+      4. Format minimal reply: domain tag + saved file path + English snippet
 
-    Hard rule: the synth answer is NEVER trusted alone. The raw hits
-    are always shown alongside so the user (or a maintainer) can verify
-    every claim against the source KB content.
+    No BM25 search, no answer synthesis. The user gets nothing but
+    the question and the path to the archived file.
 
-    The reply is also recorded for /good /bad /partial feedback (the
-    user can rate whether the OCR + synth + retrieval pipeline worked
-    end-to-end). The question we record is the OCR'd text (truncated),
-    so the feedback file shows "user asked X about Y" — useful for
-    diagnosing OCR errors vs retrieval errors.
+    The reply is also recorded for /good /bad /partial feedback (so
+    we can spot OCR vs domain-classification regressions).
     """
-    if not storage.list_documents():
-        return _empty_help(platform)
-
     # 1. OCR / VL understanding of the image.
     extracted = image_extract.extract_text(image_path)
     if not extracted:
@@ -743,64 +783,28 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     if domain is None:
         logger.info("image: domain classification skipped/failed")
 
-    # 3. Archive the question (best effort — duplicates are silently
-    #    ignored, failures are logged but don't break the user flow).
+    # 3. Archive + translate + write to per-domain folder.
+    #    save_question() handles dedup internally; is_new tells us
+    #    whether to show "已归档" or "已存在".
     source = f"{platform}:{user_id}" if user_id else platform
-    _archived_id, archived_new = _archive_if_new(extracted, domain, source)
-    if archived_new:
-        logger.info(
-            "image: archived question id=%d domain=%s (%s)",
-            _archived_id, domain, domain_name,
-        )
-    elif domain is not None:
-        logger.info("image: question already in archive (domain=%s)", domain)
+    import question_archive
+    archive_result = question_archive.save_question(
+        en_text=extracted,
+        domain=domain if domain is not None else -1,  # -1 = skip
+        source=source,
+    )
+    logger.info(
+        "image: archive result is_new=%s path=%s",
+        archive_result.get("is_new"),
+        archive_result.get("path"),
+    )
 
-    # 4. BM25 search using the extracted text as the query.
-    hits = search_mod.search(extracted, top_k=config.DEFAULT_TOP_K)
-
-    # Log the top-3 hits for every image so the operator can see
-    # the retrieval quality regardless of whether synthesis passes
-    # or fails. Cheap (just one log line) and invaluable for tuning.
-    if hits:
-        top3 = ", ".join(
-            f"{h.get('filename', '?')[:30]}:p.{h.get('page_num', '?')}={h.get('score', 0):.2f}"
-            for h in hits[:3]
-        )
-        logger.info(
-            "image: BM25 top-3 hits (n=%d): [%s]",
-            len(hits), top3,
-        )
-    else:
-        logger.info("image: BM25 returned 0 hits")
-
-    # 3. LLM synthesis (the only place LLM is allowed to "answer").
-    if not hits:
-        reply = _format_image_reply(
-            extracted_text=extracted,
-            synth_answer="",
-            synth_used=False,
-            hits=[],
-            domain=domain,
-            domain_name=domain_name,
-            archived_new=archived_new,
-        )
-        _record_last_reply(
-            platform, user_id, extracted[:200], reply, message_type="image",
-        )
-        return reply
-
-    synth = answer_synth.synthesize(extracted, hits)
-
-    # 4. Assemble reply — ALWAYS show the raw hits, even if synth was
-    #    used. The user can ignore them, but they need to be visible.
-    reply = _format_image_reply(
+    # 4. Minimal reply — no answer, no KB, no synthesis.
+    reply = _format_practice_reply(
         extracted_text=extracted,
-        synth_answer=synth.answer,
-        synth_used=synth.used_synth,
-        hits=hits,
         domain=domain,
         domain_name=domain_name,
-        archived_new=archived_new,
+        archive_result=archive_result,
     )
     _record_last_reply(
         platform, user_id, extracted[:200], reply, message_type="image",
