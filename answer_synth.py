@@ -258,6 +258,25 @@ def _answer_groundedness(answer_text: str, chunk_text: str) -> tuple[float, int]
     return len(inter) / len(a_tokens), len(inter)
 
 
+def _strip_english_section(text: str) -> str:
+    """If the LLM followed the bilingual format and produced a
+    `**English**: ...` section, drop it. The groundedness check below
+    compares answer↔chunk tokens, but English tokens don't share
+    bigrams with the Chinese-source KB chunks — so a long English
+    paraphrase dilutes the coverage score even when the Chinese
+    portion is well-grounded.
+
+    We keep the citations because they're shared by both languages.
+    """
+    # Find a `**English**:` marker (with optional `** English **:` spacing)
+    # and drop everything from there to the end.
+    import re as _re
+    m = _re.search(r"\*\*\s*English\s*\*\*\s*[:：]", text, flags=_re.IGNORECASE)
+    if m:
+        return text[: m.start()].rstrip()
+    return text
+
+
 def _is_valid_synthesis(
     text: str, hits: list[dict], question: str = "",
 ) -> bool:
@@ -315,6 +334,7 @@ def _is_valid_synthesis(
 
     citations = _extract_citations(text)
     if not citations:
+        logger.info("synth rejected: no [来源: ...] citations found in response")
         return False
 
     # Cross-check against the retrieved set. Strict: exact (filename, page)
@@ -331,6 +351,12 @@ def _is_valid_synthesis(
     coverage_threshold = config.SYNTH_ANSWER_GROUNDEDNESS_MIN
     abs_floor = config.SYNTH_ANSWER_GROUNDEDNESS_MIN_INTER
     q_tokens = set(tokenize(question)) if (question or "").strip() else set()
+
+    # The bilingual prompt asks for `**中文**:` + `**English**:`. We only
+    # check groundedness on the Chinese part because English tokens
+    # don't share bigrams with the (Chinese) source chunks and would
+    # dilute the coverage score. Citations are kept (they're shared).
+    groundedness_target = _strip_english_section(text)
 
     # For each citation, require all of:
     #   1. real reference (citation points at an actually-retrieved chunk)
@@ -360,15 +386,25 @@ def _is_valid_synthesis(
 
         # (2) answer-groundedness: did the LLM actually use the chunk?
         coverage, inter_count = _answer_groundedness(
-            text, hit.get("chunk_text", ""),
+            groundedness_target, hit.get("chunk_text", ""),
         )
         if coverage < coverage_threshold or inter_count < abs_floor:
+            logger.info(
+                "synth groundedness miss: ref=%s:%s coverage=%.3f (need %.2f) "
+                "inter=%d (need %d)",
+                filename, page_str, coverage, coverage_threshold,
+                inter_count, abs_floor,
+            )
             continue
 
         # (3) answer-on-question: is the LLM actually addressing the q?
         if q_tokens:
-            a_tokens = set(tokenize(_strip_citations(text)))
+            a_tokens = set(tokenize(_strip_citations(groundedness_target)))
             if not (a_tokens & q_tokens):
+                logger.info(
+                    "synth on-question miss: ref=%s:%s no q-tokens in answer",
+                    filename, page_str,
+                )
                 continue  # answer is generic, not addressing the question
 
         return True
@@ -425,14 +461,14 @@ def synthesize(question: str, hits: list[dict]) -> SynthResult:
         else:
             top3 = "(no BM25 hits)"
         logger.warning(
-            "answer_synth: response failed citation check, falling back. "
+            "answer_synth: response failed validity check, falling back. "
             "raw_hits=%d, top3=[%s]",
             len(hits), top3,
         )
         return SynthResult(
             answer=_EMPTY_ANSWER,
             used_synth=False,
-            error="response failed citation check",
+            error="response failed validity check (see earlier synth-* log lines)",
             input_chars=len(user_prompt),
             output_chars=out_chars,
         )
