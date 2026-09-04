@@ -6,4 +6,4 @@
 # ruff, mypy).
 
 # Coverage reporting
-coverage>=7.0
+coverage>=7.16.0
