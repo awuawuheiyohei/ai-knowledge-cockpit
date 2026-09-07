@@ -642,17 +642,18 @@ def archive_question(
     - newly inserted question's id
     - None if the question already exists (dedup hit, no insert)
 
-    The caller treats None as "already had it" and the row id as "new".
-    domain must be 1..8; the caller is responsible for the classification
-    (we don't want to call an LLM from this data layer).
+    domain is kept in the schema for backwards compatibility (the
+    table was created with a NOT NULL column), but the call no
+    longer requires a real 1..8 value — pass 0 (or anything outside
+    1..8) when classification is unknown. The domain_name column is
+    still populated from CISSP_DOMAIN_NAMES[0] which returns "" in
+    that case.
     """
     text = (question_text or "").strip()
     if not text:
         return None
-    if domain not in CISSP_DOMAIN_NAMES:
-        raise ValueError(f"domain must be 1..8, got {domain}")
     norm = _normalize_question(text)
-    domain_name = CISSP_DOMAIN_NAMES[domain]
+    domain_name = CISSP_DOMAIN_NAMES.get(domain, "")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     conn = get_conn()

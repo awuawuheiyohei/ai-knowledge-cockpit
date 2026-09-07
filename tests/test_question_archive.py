@@ -1,19 +1,18 @@
 """
 test_question_archive.py — unit tests for the practice-mode
-question archive (no-answer flow).
+question archive (no-answer flow, single flat dir).
 
-Covers:
-  - file path & folder layout (域N subdir)
-  - dedup by normalized text (storage.archive_question)
+Covers (post 2026-09-07 simplification — no per-domain subdirs):
+  - file path lives directly under QUESTIONS_DIR (no 域N subdir)
+  - dedup by normalized text
   - markdown body format (English + 中文 sections)
-  - "no domain" path (LLM classify failed) doesn't write a file
+  - empty text / no domain doesn't write a file
   - re-save returns the existing file path without writing a duplicate
 
 Run: .venv/bin/python tests/test_question_archive.py
 """
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest
@@ -37,83 +36,68 @@ class TestQuestionArchive(unittest.TestCase):
         import question_archive
         self.questions_root = Path(self.tmp.name) / "questions"
         question_archive.QUESTIONS_DIR = self.questions_root  # type: ignore[attr-defined]
-        # Also patch the module-level domain dict to ensure it lines up
-        # with the one in im_router (it does today, but be defensive).
         self.qa = question_archive
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _call(self, en, dom, src="test"):
-        return self.qa.save_question(en, dom, src)
+    def _call(self, en, src="test"):
+        return self.qa.save_question(en, src)
 
-    def test_basic_save(self):
-        r = self._call("What is RBAC?", 5)
+    def test_basic_save_to_flat_dir(self):
+        r = self._call("What is RBAC?")
         self.assertTrue(r["is_new"])
-        self.assertEqual(r["domain"], 5)
-        self.assertEqual(r["domain_name"], "身份与访问管理")
         self.assertIsNotNone(r["path"])
-        # file exists at the per-domain subdir
         assert r["path"] is not None
         self.assertTrue(str(r["path"]).endswith(".md"))
-        self.assertIn("/域5/", str(r["path"]))
+        # The file lives directly under QUESTIONS_DIR — no 域N subdir
+        self.assertEqual(r["path"].parent, self.questions_root)
+        # The path is just <questions>/<ts>-<hash>.md
+        self.assertNotIn("域", str(r["path"]))
+        # zh_text is returned for inline display
+        self.assertIsInstance(r["zh_text"], str)
 
     def test_dedup_returns_existing(self):
-        r1 = self._call("What is RBAC?", 5)
-        r2 = self._call("What is RBAC?", 5)
+        r1 = self._call("What is RBAC?")
+        r2 = self._call("What is RBAC?")
         self.assertTrue(r1["is_new"])
         self.assertFalse(r2["is_new"])
         self.assertEqual(r1["path"], r2["path"])
-        # only one file in the per-domain folder
-        assert r1["path"] is not None
-        files = list((self.questions_root / "域5").glob("*.md"))
+        files = list(self.questions_root.glob("*.md"))
         self.assertEqual(len(files), 1)
 
     def test_normalize_for_dedup(self):
-        r1 = self._call("What is RBAC?", 5)
-        r2 = self._call("  WHAT   is rbac?  ", 5)
+        r1 = self._call("What is RBAC?")
+        r2 = self._call("  WHAT   is rbac?  ")
         self.assertTrue(r1["is_new"])
         self.assertFalse(r2["is_new"])
         self.assertEqual(r1["path"], r2["path"])
 
-    def test_no_domain_no_file(self):
-        # simulate LLM classify failure: domain is None (we use -1 inside
-        # the function as the "skip" sentinel; here we test the public
-        # contract — invalid domain must not write a file)
-        r = self._call("What is TLS?", 0)  # invalid
-        self.assertFalse(r["is_new"])
-        self.assertIsNone(r["path"])
-        # nothing on disk
-        self.assertFalse(any(self.questions_root.rglob("*.md")))
-
     def test_empty_text_no_file(self):
-        r = self._call("", 5)
+        r = self._call("")
         self.assertFalse(r["is_new"])
         self.assertIsNone(r["path"])
-        r = self._call("   ", 5)
+        r = self._call("   ")
         self.assertFalse(r["is_new"])
         self.assertIsNone(r["path"])
 
     def test_markdown_format(self):
-        r = self._call("Sample question text here", 1)
+        r = self._call("Sample question text here")
         assert r["path"] is not None
         body = r["path"].read_text(encoding="utf-8")
-        self.assertIn("# 域1 · 安全与风险管理", body)
         self.assertIn("## English", body)
         self.assertIn("## 中文", body)
         self.assertIn("Sample question text here", body)
-        # The Chinese section should not be empty (LLM is configured in CI env)
-        # but the marker should at least be there.
-        self.assertIn("归档时间", body)
+        self.assertIn("来源", body)
 
     def test_different_questions_different_files(self):
-        r1 = self._call("What is CIA?", 1)
-        r2 = self._call("What is RBAC?", 5)
+        r1 = self._call("What is CIA?")
+        r2 = self._call("What is RBAC?")
         self.assertTrue(r1["is_new"])
         self.assertTrue(r2["is_new"])
         self.assertNotEqual(r1["path"], r2["path"])
-        self.assertIn("/域1/", str(r1["path"]))
-        self.assertIn("/域5/", str(r2["path"]))
+        # both in the same flat dir
+        self.assertEqual(r1["path"].parent, r2["path"].parent)
 
 
 if __name__ == "__main__":

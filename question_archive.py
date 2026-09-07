@@ -4,24 +4,27 @@ question_archive.py — save OCR'd English CISSP questions for self-study.
 User flow (DingTalk image input → practice mode):
   1. user sends a screenshot of an English CISSP question
   2. we OCR the question (image_extract.extract_text)
-  3. we classify it to one of the 8 CISSP domains (_classify_domain_via_llm)
-  4. we ask the LLM to translate the question to Chinese
+  3. we ask the LLM to translate the question to Chinese
      (no KB lookup, no answer generation — the user does the question
      themselves and only wants the Chinese so they can read it as
      study scaffolding)
-  5. we write the file to data/questions/域N/<timestamp>-<hash>.md
-  6. we return the saved path so the reply can show it
+  4. we write the file to data/questions/<timestamp>-<hash>.md
+  5. we return the saved path so the reply can show it
+
+Note: as of 2026-09-07 the user dropped the per-domain subdirectory
+layout (intelligent classification was too inaccurate). All
+questions now go into the single `data/questions/` folder. The
+SQLite dedup table still tracks them so we don't re-archive
+duplicates.
 
 Dedup:
-  - storage.archive_question() already dedups by normalized text (returns
-    None if the question was already archived). The .md file is only
-    written on a fresh archive (row_id is not None).
+  - storage.archive_question() dedups by normalized text. The .md file
+    is only written on a fresh archive (row_id is not None).
 """
 from __future__ import annotations
 
 import hashlib
 import logging
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -29,12 +32,9 @@ import storage
 
 logger = logging.getLogger("question_archive")
 
+# Single flat directory — no per-domain subdirs (2026-09-07 simplification,
+# per user request: 8-way auto-classification wasn't accurate enough).
 QUESTIONS_DIR = Path(__file__).resolve().parent / "data" / "questions"
-
-# Same domain names as im_router._DOMAIN_NAMES — kept in sync deliberately.
-# If they diverge, the saved file's "域N" line will disagree with the
-# domain_name column in archived_questions.
-DOMAIN_NAMES: dict[int, str] = storage.CISSP_DOMAIN_NAMES
 
 
 def _slug_hash(text: str) -> str:
@@ -95,97 +95,77 @@ def _translate_to_chinese(en_text: str) -> str:
 
 def save_question(
     en_text: str,
-    domain: int,
     source: str = "",
 ) -> dict:
-    """Save the (English, Chinese) question pair to the per-domain folder.
+    """Save the (English, Chinese) question pair to QUESTIONS_DIR.
 
     Returns a dict with:
-      - path: Path to the .md file (or None if dedup hit / no domain)
+      - path: Path to the .md file (or None if dedup hit)
       - is_new: True if newly written, False if already in archive
-      - domain, domain_name: the domain fields
+      - zh_text: the Chinese translation (always present, so the IM
+                 reply can show it inline; re-translated on dedup hit)
 
     Dedup is done by storage.archive_question() (normalized text key).
     The .md file is only written when archive_question returns a new id.
     """
     en_text = (en_text or "").strip()
-    if not en_text or domain not in DOMAIN_NAMES:
-        return {"path": None, "is_new": False, "domain": domain,
-                "domain_name": DOMAIN_NAMES.get(domain)}
+    if not en_text:
+        return {"path": None, "is_new": False, "zh_text": ""}
 
-    # 1. archive (dedup by normalized text)
+    # 1. archive (dedup by normalized text; domain is no longer
+    #    classified or required — pass a placeholder)
     try:
-        row_id = storage.archive_question(en_text, domain, source or "dingtalk")
+        row_id = storage.archive_question(en_text, 0, source or "dingtalk")
     except Exception as e:  # noqa: BLE001
         logger.warning("archive_question failed: %s", e)
-        return {"path": None, "is_new": False, "domain": domain,
-                "domain_name": DOMAIN_NAMES[domain]}
+        return {"path": None, "is_new": False, "zh_text": ""}
+
+    # 2. translate (best effort — empty string is acceptable; the .md
+    #    will just have an empty 中文 section the user can fill in)
+    zh_text = _translate_to_chinese(en_text)
 
     if row_id is None:
         # already archived — don't write a duplicate file
         # (find the existing file for path reporting)
-        existing = _find_existing_file(en_text, domain)
-        # Re-translate so the reply still shows 中文 even on dedup.
-        # Cheap (one LLM call) and the user always wants the translation
-        # in the chat reply, not just in the file.
-        zh_text_dedup = _translate_to_chinese(en_text)
+        existing = _find_existing_file(en_text)
         return {
             "path": existing,
             "is_new": False,
-            "domain": domain,
-            "domain_name": DOMAIN_NAMES[domain],
-            "zh_text": zh_text_dedup,
+            "zh_text": zh_text,
         }
 
-    # 2. translate (best effort — empty string is acceptable; the .md
-    # will just have an empty 中文 section the user can fill in)
-    zh_text = _translate_to_chinese(en_text)
-
     # 3. write file
-    domain_name = DOMAIN_NAMES[domain]
-    dir_ = QUESTIONS_DIR / f"域{domain}"
-    dir_.mkdir(parents=True, exist_ok=True)
+    QUESTIONS_DIR.mkdir(parents=True, exist_ok=True)
     slug = _slug_hash(en_text)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = dir_ / f"{ts}-{slug}.md"
+    path = QUESTIONS_DIR / f"{ts}-{slug}.md"
     body = _render_markdown(
-        en_text=en_text, zh_text=zh_text,
-        domain=domain, domain_name=domain_name,
-        source=source or "dingtalk",
+        en_text=en_text, zh_text=zh_text, source=source or "dingtalk",
     )
     path.write_text(body, encoding="utf-8")
-    logger.info(
-        "saved question id=%d domain=域%d path=%s",
-        row_id, domain, path,
-    )
+    logger.info("saved question id=%d path=%s", row_id, path)
     return {
         "path": path,
         "is_new": True,
-        "domain": domain,
-        "domain_name": domain_name,
         "zh_text": zh_text,
     }
 
 
-def _find_existing_file(en_text: str, domain: int) -> Path | None:
+def _find_existing_file(en_text: str) -> Path | None:
     """Best-effort lookup of an already-archived question's file path.
     The stored question_text is the normalized form, not the file
     name, so we scan the directory for any .md with the matching hash.
     """
-    if domain not in DOMAIN_NAMES:
+    if not QUESTIONS_DIR.exists():
         return None
     slug = _slug_hash(en_text)
-    dir_ = QUESTIONS_DIR / f"域{domain}"
-    if not dir_.exists():
-        return None
-    for p in dir_.glob(f"*-{slug}.md"):
+    for p in QUESTIONS_DIR.glob(f"*-{slug}.md"):
         return p
     return None
 
 
 def _render_markdown(
-    en_text: str, zh_text: str,
-    domain: int, domain_name: str, source: str,
+    en_text: str, zh_text: str, source: str,
 ) -> str:
     """Format the saved .md file. English first, Chinese second —
     matches the user's reading order (read English to attempt,
@@ -193,10 +173,9 @@ def _render_markdown(
     en_text = en_text.strip()
     zh_text = zh_text.strip()
     parts: list[str] = []
-    parts.append(f"# 域{domain} · {domain_name}")
+    parts.append(f"# {datetime.now().isoformat(timespec='seconds')}")
     parts.append("")
     parts.append(f"**来源**: `{source}`")
-    parts.append(f"**归档时间**: {datetime.now().isoformat(timespec='seconds')}")
     parts.append("")
     parts.append("## English")
     parts.append("")

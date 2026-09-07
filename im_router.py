@@ -608,120 +608,35 @@ def _split_for_im(reply: str, max_len: int = 3800) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Domain classification (added 2026-09-03)
+# Domain classification removed (2026-09-07) — user found the LLM
+# 8-way classifier too inaccurate. All archived questions go into
+# the single flat `data/questions/` directory regardless of which
+# CISSP domain they actually belong to. The SQLite table still has
+# a `domain` column (we pass 0) for backwards compatibility.
 # ---------------------------------------------------------------------------
-
-_DOMAIN_NAMES: dict[int, str] = {
-    1: "安全与风险管理",
-    2: "资产安全",
-    3: "安全架构与工程",
-    4: "通信与网络安全",
-    5: "身份与访问管理",
-    6: "安全评估与测试",
-    7: "安全运营",
-    8: "软件开发安全",
-}
-
-
-def _classify_domain_via_llm(text: str) -> int | None:
-    """Ask the configured LLM to map an English CISSP question to one
-    of the 8 domains. Returns 1..8 or None on any failure.
-
-    Why a separate LLM call instead of keyword matching: questions are
-    paraphrased and cover many sub-topics; a small classifier prompt
-    generalizes better than hand-tuned rules. We reuse the same Anthropic
-    client + config as answer_synth so no new credentials needed.
-    """
-    if not text or not text.strip():
-        return None
-    try:
-        import llm_config
-        import anthropic
-    except ImportError:
-        return None
-    if not llm_config.is_llm_configured():
-        return None
-    try:
-        cfg = llm_config.load_llm_config()
-        client = anthropic.Anthropic(
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
-            timeout=cfg.timeout_s,
-            max_retries=0,
-        )
-        domain_list = "\n".join(f"{n}. {name}" for n, name in _DOMAIN_NAMES.items())
-        resp = client.messages.create(
-            model=cfg.model,
-            max_tokens=8,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "你是一个 CISSP 题目分类器。下面是 8 个域:\n"
-                    f"{domain_list}\n\n"
-                    "阅读用户给出的英文题目,只回复一个 1-8 的数字,"
-                    "代表这道题最相关的域。不要任何解释、标点、换行。\n\n"
-                    f"题目:\n{text[:1500]}"
-                ),
-            }],
-        )
-        # Concatenate all text blocks defensively.
-        out = "".join(
-            getattr(b, "text", "")
-            for b in resp.content
-            if getattr(b, "type", None) == "text"
-        ).strip()
-        # Pick the first digit 1-8 we see.
-        for ch in out:
-            if ch in "12345678":
-                return int(ch)
-        logger.info("classify_domain: LLM returned no digit, raw=%r", out[:60])
-        return None
-    except Exception as e:  # noqa: BLE001
-        logger.warning("classify_domain failed: %s", e)
-        return None
-
-
-def _archive_if_new(question_text: str, domain: int | None, source: str) -> tuple[int | None, bool]:
-    """Archive the (English) question text. Returns (row_id_or_none, archived_bool).
-    - row_id_or_none: the new id if newly inserted, None if already existed
-    - archived_bool: True if we actually inserted (False if dedup or no domain)
-    """
-    if domain is None or not question_text.strip():
-        return None, False
-    try:
-        row_id = storage.archive_question(question_text, domain, source)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("archive_question failed: %s", e)
-        return None, False
-    return row_id, row_id is not None
 
 
 def _format_practice_reply(
     extracted_text: str,
-    domain: int | None,
-    domain_name: str | None,
     archive_result: dict,
 ) -> str:
     """Reply shown in the IM for the practice (no-answer) flow.
 
     Layout (kept minimal — the user wants to do the question themselves):
-      1. Domain tag (域N · 中文名) + archive state
+      1. Archive state (已归档 / 已存在 / 归档失败)
       2. The English question the bot extracted (so the user can sanity
          check the OCR before they start working on the saved file)
       3. The Chinese translation the bot archived (so the user can
          read it in-chat without opening the saved file)
     """
     lines: list[str] = []
-    if domain is not None and domain_name:
-        if archive_result.get("is_new"):
-            archive_note = "已归档"
-        elif archive_result.get("path"):
-            archive_note = "已存在(未重复保存)"
-        else:
-            archive_note = "归档失败(LLM 不可用?)"
-        lines.append(f"### 🏷️ 域{domain} · {domain_name} · {archive_note}")
+    if archive_result.get("is_new"):
+        archive_note = "已归档"
+    elif archive_result.get("path"):
+        archive_note = "已存在(未重复保存)"
     else:
-        lines.append("### 🏷️ 域:_(未识别)_")
+        archive_note = "归档失败"
+    lines.append(f"### 📥 {archive_note}")
     lines.append("")
 
     # Show the file path so the user can find it on disk.
@@ -755,25 +670,23 @@ def _format_practice_reply(
 
 def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     """
-    Image input entry point (场景 2 — practice mode, 2026-09-03 redesign).
+    Image input entry point (场景 2 — practice mode, 2026-09-07 simplification).
 
     The user does NOT want the bot to give the answer. They want to
     self-study: read the English question, attempt it themselves, then
     verify against the Chinese translation that the bot archived.
 
-    Pipeline:
-      1. image_extract.extract_text()  → user's question as text
-      2. classify_domain(text)         → CISSP domain 1..8 (best effort)
-      3. question_archive.save_question → write data/questions/域N/<ts>-<hash>.md
-                                          with English + Chinese translation,
-                                          dedup by normalized text
-      4. Format minimal reply: domain tag + saved file path + English snippet
+    Pipeline (simplified 2026-09-07 — no more per-domain classification):
+      1. image_extract.extract_text()       → user's question as text
+      2. question_archive.save_question()    → write data/questions/<ts>-<hash>.md
+         with English + Chinese translation, dedup by normalized text
+      3. Format minimal reply: archive state + file path + English + 中文
 
-    No BM25 search, no answer synthesis. The user gets nothing but
-    the question and the path to the archived file.
+    No BM25 search, no answer synthesis, no domain classification.
+    The user gets the question and the Chinese translation, nothing more.
 
-    The reply is also recorded for /good /bad /partial feedback (so
-    we can spot OCR vs domain-classification regressions).
+    The reply is recorded for /good /bad /partial feedback (so we can
+    spot OCR regressions).
     """
     # 1. OCR / VL understanding of the image.
     extracted = image_extract.extract_text(image_path)
@@ -790,21 +703,13 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
         )
         return reply
 
-    # 2. Classify the question into one of the 8 CISSP domains
-    #    (best effort — LLM call may fail or be unconfigured).
-    domain = _classify_domain_via_llm(extracted)
-    domain_name = _DOMAIN_NAMES.get(domain) if domain else None
-    if domain is None:
-        logger.info("image: domain classification skipped/failed")
-
-    # 3. Archive + translate + write to per-domain folder.
+    # 2. Archive + translate + write to flat data/questions/ dir.
     #    save_question() handles dedup internally; is_new tells us
     #    whether to show "已归档" or "已存在".
     source = f"{platform}:{user_id}" if user_id else platform
     import question_archive
     archive_result = question_archive.save_question(
         en_text=extracted,
-        domain=domain if domain is not None else -1,  # -1 = skip
         source=source,
     )
     logger.info(
@@ -813,11 +718,9 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
         archive_result.get("path"),
     )
 
-    # 4. Minimal reply — no answer, no KB, no synthesis.
+    # 3. Minimal reply — no answer, no KB, no synthesis, no domain tag.
     reply = _format_practice_reply(
         extracted_text=extracted,
-        domain=domain,
-        domain_name=domain_name,
         archive_result=archive_result,
     )
     _record_last_reply(

@@ -2,12 +2,15 @@
 test_archived_questions.py — unit tests for the archived_questions table
 + storage.CISSP_DOMAIN_NAMES + the dedup/normalize logic.
 
+Domain classification was dropped (2026-09-07), so we no longer
+require domain to be 1..8 — we still pass it for backwards
+compatibility with the existing schema.
+
 Run with: .venv/bin/python -m pytest tests/test_archived_questions.py -v
 or:       .venv/bin/python tests/test_archived_questions.py
 """
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest
@@ -42,46 +45,50 @@ class TestArchivedQuestions(unittest.TestCase):
 
     def test_insert_and_dedup(self):
         import storage
-        rid1 = storage.archive_question("What is CIA?", 1, "test:user")
+        rid1 = storage.archive_question("What is CIA?", 0, "test:user")
         self.assertIsNotNone(rid1)
-        rid2 = storage.archive_question("What is CIA?", 1, "test:user")
+        rid2 = storage.archive_question("What is CIA?", 0, "test:user")
         self.assertIsNone(rid2)  # dedup hit
         self.assertEqual(storage.count_archived_questions(), 1)
 
     def test_normalize_collapse_whitespace_and_case(self):
         import storage
-        rid1 = storage.archive_question("What is CIA?", 1, "test:user")
+        rid1 = storage.archive_question("What is CIA?", 0, "test:user")
         self.assertIsNotNone(rid1)
         # different case + extra whitespace + trailing space should dedup
-        rid2 = storage.archive_question("  WHAT  is   cia?  ", 1, "test:user")
+        rid2 = storage.archive_question("  WHAT  is   cia?  ", 0, "test:user")
         self.assertIsNone(rid2)
         self.assertEqual(storage.count_archived_questions(), 1)
         rows = storage.list_archived_questions()
         self.assertEqual(rows[0]["question_text"], "what is cia?")
 
-    def test_domain_filter(self):
+    def test_no_domain_filter(self):
+        # After 2026-09-07, we don't filter by domain anymore
+        # (all questions go into a single flat dir).
         import storage
-        storage.archive_question("Q1", 1, "src")
-        storage.archive_question("Q2", 4, "src")
-        storage.archive_question("Q3", 4, "src")
+        storage.archive_question("Q1", 0, "src")
+        storage.archive_question("Q2", 0, "src")
+        storage.archive_question("Q3", 0, "src")
         self.assertEqual(storage.count_archived_questions(), 3)
-        self.assertEqual(storage.count_archived_questions(domain=4), 2)
-        self.assertEqual(storage.count_archived_questions(domain=8), 0)
-        rows = storage.list_archived_questions(domain=4)
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(r["domain"] == 4 for r in rows))
+        rows = storage.list_archived_questions()
+        self.assertEqual(len(rows), 3)
 
-    def test_domain_validation(self):
+    def test_legacy_domain_param_still_accepted(self):
+        # archive_question still accepts the int (for backwards compat)
+        # but no longer validates 1..8 — anything is fine.
         import storage
-        with self.assertRaises(ValueError):
-            storage.archive_question("Q", 0, "src")
-        with self.assertRaises(ValueError):
-            storage.archive_question("Q", 9, "src")
+        rid1 = storage.archive_question("Q with domain=5", 5, "src")
+        self.assertIsNotNone(rid1)
+        rid2 = storage.archive_question("Q with domain=0", 0, "src")
+        self.assertIsNotNone(rid2)
+        rid3 = storage.archive_question("Q with domain=99", 99, "src")
+        self.assertIsNotNone(rid3)
+        self.assertEqual(storage.count_archived_questions(), 3)
 
     def test_empty_text_is_noop(self):
         import storage
-        self.assertIsNone(storage.archive_question("", 1, "src"))
-        self.assertIsNone(storage.archive_question("   ", 1, "src"))
+        self.assertIsNone(storage.archive_question("", 0, "src"))
+        self.assertIsNone(storage.archive_question("   ", 0, "src"))
         self.assertEqual(storage.count_archived_questions(), 0)
 
 
