@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -619,6 +620,7 @@ def _split_for_im(reply: str, max_len: int = 3800) -> list[str]:
 def _format_practice_reply(
     extracted_text: str,
     archive_result: dict,
+    truncated: bool = False,
 ) -> str:
     """Reply shown in the IM for the practice (no-answer) flow.
 
@@ -628,6 +630,8 @@ def _format_practice_reply(
          check the OCR before they start working on the saved file)
       3. The Chinese translation the bot archived (so the user can
          read it in-chat without opening the saved file)
+      4. Truncation warning if the OCR model flagged the screenshot
+         as possibly incomplete
     """
     lines: list[str] = []
     if archive_result.get("is_new"):
@@ -646,8 +650,8 @@ def _format_practice_reply(
         lines.append("")
 
     snippet = extracted_text.strip().replace("\n", " ")
-    if len(snippet) > 800:
-        snippet = snippet[:800].rstrip() + "…"
+    if len(snippet) > 4000:
+        snippet = snippet[:4000].rstrip() + "…(已截断,完整见文件)"
     lines.append("### 📷 英文原题")
     lines.append(f"> {snippet or '_(空)_'}")
     lines.append("")
@@ -655,12 +659,20 @@ def _format_practice_reply(
     zh_text = (archive_result.get("zh_text") or "").strip()
     if zh_text:
         lines.append("### 🀄 中文翻译")
-        # Same 800-char cap on the in-chat snippet so we don't blow past
-        # the IM message size limit on long questions.
+        # Same 4000-char cap on the in-chat snippet so we don't blow
+        # past the IM message size limit (~6KB for DingTalk markdown).
         zh_snippet = zh_text.replace("\n", " ")
-        if len(zh_snippet) > 800:
-            zh_snippet = zh_snippet[:800].rstrip() + "…"
+        if len(zh_snippet) > 4000:
+            zh_snippet = zh_snippet[:4000].rstrip() + "…(已截断,完整见文件)"
         lines.append(f"> {zh_snippet}")
+        lines.append("")
+
+    if truncated:
+        # The VL OCR model thinks the screenshot was cropped. Surface
+        # this so the user can re-shoot if needed (or at least be aware
+        # the saved file is missing the trailing bits).
+        lines.append("⚠️ **OCR 检测到题目可能被截断** — 请检查截图是否漏掉了选项或题干末尾。"
+                     "如果漏了,重新截一张完整的再发。")
         lines.append("")
 
     lines.append("---")
@@ -703,6 +715,17 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
         )
         return reply
 
+    # 1a. Detect OCR truncation marker. image_extract's prompt asks the
+    # VL model to append `[TRUNCATED]` if the screenshot looks cropped.
+    # Strip the marker from the stored text (we don't want it in the
+    # .md file or in dedup hashes) but pass a flag to the reply
+    # formatter so the user gets a visible warning.
+    truncated = bool(re.search(r"\[truncated\]", extracted, re.IGNORECASE))
+    if truncated:
+        extracted = re.sub(
+            r"\s*\[truncated\]\s*", " ", extracted, flags=re.IGNORECASE
+        ).rstrip()
+
     # 2. Archive + translate + write to flat data/questions/ dir.
     #    save_question() handles dedup internally; is_new tells us
     #    whether to show "已归档" or "已存在".
@@ -722,6 +745,7 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     reply = _format_practice_reply(
         extracted_text=extracted,
         archive_result=archive_result,
+        truncated=truncated,
     )
     _record_last_reply(
         platform, user_id, extracted[:200], reply, message_type="image",

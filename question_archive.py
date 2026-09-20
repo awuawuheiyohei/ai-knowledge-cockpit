@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -96,6 +97,7 @@ def _translate_to_chinese(en_text: str) -> str:
 def save_question(
     en_text: str,
     source: str = "",
+    fuzzy_threshold: float = 0.88,
 ) -> dict:
     """Save the (English, Chinese) question pair to QUESTIONS_DIR.
 
@@ -105,33 +107,56 @@ def save_question(
       - zh_text: the Chinese translation (always present, so the IM
                  reply can show it inline; re-translated on dedup hit)
 
-    Dedup is done by storage.archive_question() (normalized text key).
-    The .md file is only written when archive_question returns a new id.
+    Dedup is two-tier:
+      1. exact (storage.archive_question) — normalized-text UNIQUE key
+      2. fuzzy (this function) — SequenceMatcher.ratio >= fuzzy_threshold
+         against recent saved files; catches near-duplicates that the
+         exact match misses (different OCR of the same screenshot,
+         trailing whitespace, dropped question numbers, etc.)
+
+    The .md file is only written when both tiers say "new".
     """
     en_text = (en_text or "").strip()
     if not en_text:
         return {"path": None, "is_new": False, "zh_text": ""}
 
-    # 1. archive (dedup by normalized text; domain is no longer
-    #    classified or required — pass a placeholder)
+    # Tier 1: normalized-text exact dedup.
     try:
         row_id = storage.archive_question(en_text, 0, source or "dingtalk")
     except Exception as e:  # noqa: BLE001
         logger.warning("archive_question failed: %s", e)
         return {"path": None, "is_new": False, "zh_text": ""}
 
-    # 2. translate (best effort — empty string is acceptable; the .md
-    #    will just have an empty 中文 section the user can fill in)
+    # Translate regardless of outcome — the IM reply always wants the
+    # Chinese translation even on a dedup hit.
     zh_text = _translate_to_chinese(en_text)
 
     if row_id is None:
-        # already archived — don't write a duplicate file
-        # (find the existing file for path reporting)
+        # exact dedup hit — find the existing file
         existing = _find_existing_file(en_text)
         return {
             "path": existing,
             "is_new": False,
             "zh_text": zh_text,
+            "fuzzy_match": False,
+        }
+
+    # Tier 2: fuzzy dedup — check if any existing file has very similar
+    # text (different OCR of same question). If so, treat as duplicate
+    # and DO NOT write a new file. The just-inserted SQLite row stays
+    # (harmless — it's only ~80 bytes and we don't want to reach into
+    # storage internals from here).
+    fuzzy_hit = _fuzzy_find_existing(en_text, threshold=fuzzy_threshold)
+    if fuzzy_hit is not None:
+        logger.info(
+            "fuzzy dedup hit (threshold=%.2f): new=%s, existing=%s",
+            fuzzy_threshold, en_text[:40], fuzzy_hit.stem,
+        )
+        return {
+            "path": fuzzy_hit,
+            "is_new": False,
+            "zh_text": zh_text,
+            "fuzzy_match": True,
         }
 
     # 3. write file
@@ -148,7 +173,51 @@ def save_question(
         "path": path,
         "is_new": True,
         "zh_text": zh_text,
+        "fuzzy_match": False,
     }
+
+
+def _normalize(text: str) -> str:
+    """Local copy of the storage normalizer (lowercase + collapse ws).
+    Kept here so we don't have to reach into storage internals."""
+    return " ".join(text.lower().split())
+
+
+def _fuzzy_find_existing(en_text: str, threshold: float) -> Path | None:
+    """Scan the QUESTIONS_DIR for any .md whose English question is
+    fuzzy-similar to en_text. Returns the existing path if a match is
+    found above the threshold, else None.
+
+    We only inspect the .md files (not the SQLite rows) because the
+    fuzzy similarity is best computed on the exact English text we
+    would have saved — not the normalized form used for the dedup key.
+    """
+    if not QUESTIONS_DIR.exists():
+        return None
+    from difflib import SequenceMatcher
+
+    needle = _normalize(en_text)
+    for p in QUESTIONS_DIR.glob("*.md"):
+        body = _read_english_from_md(p)
+        if not body:
+            continue
+        ratio = SequenceMatcher(None, needle, _normalize(body)).ratio()
+        if ratio >= threshold:
+            return p
+    return None
+
+
+def _read_english_from_md(path: Path) -> str:
+    """Read back the English question text from a saved .md file. The
+    file is laid out by _render_markdown with an `## English` header
+    followed by the raw text, terminated by the next `## ` section.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    m = re.search(r"## English\s*\n(.+?)(?=\n## |\Z)", text, flags=re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 def _find_existing_file(en_text: str) -> Path | None:

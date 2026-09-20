@@ -37,6 +37,12 @@ test-cov:
 	$(PY) -m coverage report -m --skip-empty
 
 lint:
+
+# Background dedup — dry-run by default, pass APPLY=1 to actually merge.
+dedup-questions:
+	.venv/bin/python tools/dedup_questions.py $(if $(APPLY),--apply,)
+
+lint:
 	@for f in *.py exam/*.py tools/*.py; do \
 	  $(PY) -m py_compile "$$f" || exit 1; \
 	done
