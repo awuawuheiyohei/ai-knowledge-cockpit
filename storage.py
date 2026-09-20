@@ -703,6 +703,120 @@ def list_archived_questions(
         conn.close()
 
 
+def delete_archived_row(row_id: int) -> bool:
+    """Delete an archived row by id. Returns True if a row was deleted."""
+    conn = get_conn()
+    try:
+        with tx(conn):
+            cur = conn.execute(
+                "DELETE FROM archived_questions WHERE id = ?", (row_id,)
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def replace_archived_text(
+    row_id: int,
+    new_text: str,
+) -> int | None:
+    """Atomically replace the question_text of an archived row.
+    Used by the continuation-merge logic so the merged question can
+    re-use the existing row's metadata (source, created_at-within-
+    the UNIQUE window).
+
+    Returns the new row's id, or None on collision (i.e. some other
+    row already has the same normalized text — in that case the old
+    row is restored verbatim so the merge is fully rolled back).
+
+    SQLite UNIQUE on question_text means we have to delete the old
+    row before inserting the new one; both happen in the same tx so
+    concurrent reads either see the old or the new, never neither.
+    """
+    new_norm = _normalize_question(new_text)
+    if not new_norm:
+        return None
+    conn = get_conn()
+    try:
+        with tx(conn):
+            old_row = conn.execute(
+                "SELECT question_text, domain, source FROM archived_questions "
+                "WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if old_row is None:
+                return None
+            old_text, old_domain, old_source = (
+                old_row["question_text"], old_row["domain"], old_row["source"]
+            )
+            conn.execute("DELETE FROM archived_questions WHERE id = ?", (row_id,))
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO archived_questions "
+                    "(question_text, domain, domain_name, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        new_norm, old_domain,
+                        CISSP_DOMAIN_NAMES.get(old_domain, ""),
+                        old_source, now,
+                    ),
+                )
+                return int(cur.lastrowid)
+            except Exception:  # noqa: BLE001 — UNIQUE collision
+                # restore old row verbatim
+                conn.execute(
+                    "INSERT INTO archived_questions "
+                    "(question_text, domain, domain_name, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        old_text, old_domain,
+                        CISSP_DOMAIN_NAMES.get(old_domain, ""),
+                        old_source, now,
+                    ),
+                )
+                return None
+    finally:
+        conn.close()
+
+
+def find_recent_archives(
+    source: str,
+    seconds: int = 180,
+    requires_truncated: bool = False,
+    max_count: int = 5,
+) -> list[dict]:
+    """Return recent archives from this source (within `seconds`),
+    newest first. Optionally filtered to those whose question_text
+    contains the literal `[TRUNCATED]` marker. Used by the
+    continuation-detection logic.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        if requires_truncated:
+            rows = conn.execute(
+                "SELECT id, question_text, domain, source, created_at "
+                "FROM archived_questions "
+                "WHERE source = ? AND created_at >= ? "
+                "AND question_text LIKE '%[TRUNCATED]%' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (source, cutoff, max_count),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, question_text, domain, source, created_at "
+                "FROM archived_questions "
+                "WHERE source = ? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (source, cutoff, max_count),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def count_archived_questions(domain: int | None = None) -> int:
     conn = get_conn()
     try:

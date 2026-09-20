@@ -625,7 +625,7 @@ def _format_practice_reply(
     """Reply shown in the IM for the practice (no-answer) flow.
 
     Layout (kept minimal — the user wants to do the question themselves):
-      1. Archive state (已归档 / 已存在 / 归档失败)
+      1. Archive state (已归档 / 已合并 / 已存在 / 归档失败)
       2. The English question the bot extracted (so the user can sanity
          check the OCR before they start working on the saved file)
       3. The Chinese translation the bot archived (so the user can
@@ -634,7 +634,10 @@ def _format_practice_reply(
          as possibly incomplete
     """
     lines: list[str] = []
-    if archive_result.get("is_new"):
+    if archive_result.get("was_continuation"):
+        merged_len = archive_result.get("merged_len", "?")
+        archive_note = f"已合并（当前题目 {merged_len} 字）"
+    elif archive_result.get("is_new"):
         archive_note = "已归档"
     elif archive_result.get("path"):
         archive_note = "已存在(未重复保存)"
@@ -731,14 +734,21 @@ def handle_image(platform: str, image_path: str, user_id: str = "") -> str:
     #    whether to show "已归档" or "已存在".
     source = f"{platform}:{user_id}" if user_id else platform
     import question_archive
-    archive_result = question_archive.save_question(
-        en_text=extracted,
-        source=source,
-    )
+    # 2a. Try auto-merge first (handles multi-screenshot continuation:
+    #     the user pastes a 2nd screenshot within 180s of a truncated
+    #     one, and we append if the boundary tokens match).
+    archive_result = question_archive.append_continuation(extracted, source)
+    if archive_result is None:
+        # No continuation candidate — save as new question.
+        archive_result = question_archive.save_question(
+            en_text=extracted,
+            source=source,
+        )
     logger.info(
-        "image: archive result is_new=%s path=%s",
+        "image: archive result is_new=%s path=%s continuation=%s",
         archive_result.get("is_new"),
         archive_result.get("path"),
+        archive_result.get("was_continuation", False),
     )
 
     # 3. Minimal reply — no answer, no KB, no synthesis, no domain tag.

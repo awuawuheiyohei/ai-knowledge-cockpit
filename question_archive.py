@@ -183,6 +183,254 @@ def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+# ---------------------------------------------------------------------------
+# Continuation detection (auto-merge consecutive screenshots)
+# ---------------------------------------------------------------------------
+
+# Heuristics guard rails — if any of these fires, we DO NOT merge.
+# Listed positively so tests can assert the exact decision boundary.
+_MAX_CONTINUATIONS_PER_QUESTION = 5  # hard safety cap
+_TIME_WINDOW_SECONDS = 180  # default merge window
+_TRUNCATED_RE = re.compile(r"\[truncated\]", re.IGNORECASE)
+_NEW_QUESTION_START_RE = re.compile(r"^\s*(?:\d+[\.\)、]|q(?:uestion)?\s*\d+|question\b)",
+                                   re.IGNORECASE)
+
+
+def _strip_word_punct(s: str) -> list[str]:
+    """Tokenize like .split() but also strip leading/trailing
+    punctuation from every word so 'rotated.' and 'rotated' compare
+    equal. Without this, a sentence-final period breaks trigram
+    matching across the screenshot boundary."""
+    out: list[str] = []
+    for w in s.lower().split():
+        out.append(w.strip(".,;:!?'\"()[]{}<>"))
+    return [w for w in out if w]
+
+
+_OPTION_LETTER_RE = re.compile(r"^\s*([A-Ea-e])[\.\)]")
+
+# Common short words that frequently appear at sentence/clause boundaries
+# in OCR text. We filter these out of the n=1 boundary alignment so a
+# pair of unrelated screenshots that both happen to end/start with "the"
+# doesn't get falsely merged.
+_BOUNDARY_STOPWORDS = frozenset({
+    "the", "and", "or", "is", "are", "was", "were", "be", "been",
+    "a", "an", "of", "to", "in", "for", "on", "at", "by", "with",
+    "as", "from", "this", "that", "it", "its", "if", "but", "not",
+})
+
+
+def _is_option_letter_continuation(prev_text: str, new_text: str) -> bool:
+    """Detect: prev's last visible line is option X (A..E) and new's
+    first line starts with option X+1. Strong signal that the new
+    screenshot is the rest of the options list."""
+    prev_lines = [ln for ln in prev_text.splitlines() if ln.strip()]
+    new_lines = [ln for ln in new_text.splitlines() if ln.strip()]
+    if not prev_lines or not new_lines:
+        return False
+    m_prev = _OPTION_LETTER_RE.match(prev_lines[-1])
+    m_new = _OPTION_LETTER_RE.match(new_lines[0])
+    if not (m_prev and m_new):
+        return False
+    prev_letter = m_prev.group(1).upper()
+    new_letter = m_new.group(1).upper()
+    expected = chr(ord(prev_letter) + 1)
+    if expected > "E":
+        return False
+    return new_letter == expected
+
+
+def _has_boundary_alignment(
+    prev_tokens: list[str],
+    new_tokens: list[str],
+    min_token_len: int = 4,
+) -> bool:
+    """Detect suffix/prefix overlap at the prev/new boundary.
+
+    Returns True when the last n tokens of `prev_tokens` equal the
+    first n tokens of `new_tokens` for some n, with these guards:
+      - n >= 2: any match counts (handles "...be rotated every ninety")
+      - n == 1: only counts when the matched token is a content word
+        (length >= min_token_len AND not in _BOUNDARY_STOPWORDS). This
+        catches the mid-word OCR-cut case ("...rotated" / "rotated
+        every...") without false-merging two unrelated screenshots
+        that happen to both start/end with a stopword like "the".
+
+    This replaces the old shared-trigram check, which required 3 tokens
+    of overlap and missed the very common 1-token mid-word case.
+    """
+    if not prev_tokens or not new_tokens:
+        return False
+    max_n = min(len(prev_tokens), len(new_tokens))
+    # n >= 2 first (any match wins)
+    for n in range(max_n, 1, -1):
+        if prev_tokens[-n:] == new_tokens[:n]:
+            return True
+    # n == 1: content-word only
+    last = prev_tokens[-1]
+    first = new_tokens[0]
+    if last == first and len(last) >= min_token_len and last not in _BOUNDARY_STOPWORDS:
+        return True
+    return False
+
+
+def _is_continuation(prev_text: str, new_text: str) -> bool:
+    """Decide whether `new_text` is a continuation of `prev_text`.
+
+    Conservative — only returns True when MULTIPLE independent signals
+    align. False negatives (refusing to merge a real continuation) are
+    cheap; false positives (silently merging two different questions)
+    corrupt the archive, so we err on the side of refusing.
+
+    Signals (1 and 2 are mandatory; 3a OR 3b is also required):
+      1. prev_text contains `[TRUNCATED]` (set by the OCR prompt when
+         it suspected the prior screenshot was cropped)
+      2. new_text's first non-space character does NOT look like the
+         start of a brand-new question (digit / "Question N" / "Q.")
+      3a. boundary alignment: prev's last n tokens == new's first n
+          tokens for n >= 2 (any) or n == 1 with content-word check.
+          Catches both "...phrase continuation" (n>=2) and "...word
+          continuation" (n=1, mid-word OCR cut).
+      3b. option-letter continuation: prev's last visible line ends
+          with option X (A..E) and new's first line starts with X+1.
+
+    Tokens are stripped of leading/trailing punctuation before
+    comparison so "rotated." ≈ "rotated".
+    """
+    if not prev_text or not new_text:
+        return False
+    if not _TRUNCATED_RE.search(prev_text):
+        return False
+    if _NEW_QUESTION_START_RE.match(new_text):
+        return False
+
+    prev_clean = _TRUNCATED_RE.sub("", prev_text).strip()
+    if not prev_clean.strip():
+        return False
+
+    prev_tokens = _strip_word_punct(prev_clean)[-50:]
+    new_tokens = _strip_word_punct(new_text)[:30]
+    if len(prev_tokens) < 3 or len(new_tokens) < 3:
+        return False
+
+    if _has_boundary_alignment(prev_tokens, new_tokens):
+        return True
+    if _is_option_letter_continuation(prev_clean, new_text):
+        return True
+    return False
+
+
+def append_continuation(
+    en_text: str,
+    source: str,
+    seconds: int = _TIME_WINDOW_SECONDS,
+    max_per_question: int = _MAX_CONTINUATIONS_PER_QUESTION,
+) -> dict | None:
+    """Try to append `en_text` to the most recent truncated archive
+    from `source` within `seconds`.
+
+    Returns:
+      - None: no continuation candidate (caller should fall through
+        to save_question)
+      - dict: {path, is_new=False, zh_text, fuzzy_match=False,
+                      was_continuation=True, merged_from_id=<old_id>,
+                      merged_len=<new len>}
+
+    The merge is precise:
+      - prev had `[TRUNCATED]` (set by OCR)
+      - new is not a new question start
+      - at least one shared trigram across the boundary
+      - within the time window from same source
+      - dedup against the merged text (collision is rolled back)
+
+    Hard safety: each row's question_text is capped at
+    `_MAX_CONTINUATIONS_PER_QUESTION` implied continuations by
+    counting `[TRUNCATED]` markers in the previous archive — if
+    too many were already merged into the candidate, we don't merge
+    again.
+    """
+    if not en_text.strip():
+        return None
+
+    candidates = storage.find_recent_archives(
+        source=source,
+        seconds=seconds,
+        requires_truncated=True,
+        max_count=max_per_question,
+    )
+    for cand in candidates:
+        prev_text = cand["question_text"]
+
+        # Safety cap: refuse to merge if the candidate has already
+        # absorbed too many continuations. Each merge strips one
+        # [TRUNCATED] marker from `prev_text` and adds no new marker,
+        # so counting markers in `prev_text` approximates the
+        # number of unfinished continuations still pending. (0 markers
+        # means the prev wasn't truncated — but we filter on
+        # requires_truncated=True so this branch is defensive only.)
+        prev_marker_count = len(_TRUNCATED_RE.findall(prev_text))
+        if prev_marker_count == 0:
+            # Already-merged (someone else completed it). Skip.
+            continue
+
+        if not _is_continuation(prev_text, en_text):
+            continue
+
+        # Merge: strip the [TRUNCATED] marker, append new text.
+        prev_clean = _TRUNCATED_RE.sub(" ", prev_text).strip()
+        merged_text = (prev_clean + " " + en_text.strip()).strip()
+
+        # Re-translate the FULL merged text so the Chinese translation
+        # is consistent with the new English (cheap: one LLM call).
+        zh_text = _translate_to_chinese(merged_text)
+
+        # Update SQLite atomically (delete old, insert new — both in
+        # the same tx so concurrent reads see a coherent state).
+        try:
+            new_id = storage.replace_archived_text(cand["id"], merged_text)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("merge DB update failed: %s", e)
+            return None
+        if new_id is None:
+            logger.info(
+                "merge dedup collision on id=%d — merged text already exists",
+                cand["id"],
+            )
+            return None
+
+        # Rewrite .md file at a fresh path (timestamp + new hash).
+        old_path = _find_existing_file(prev_text)
+        new_slug = _slug_hash(merged_text)
+        new_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        new_path = QUESTIONS_DIR / f"{new_ts}-{new_slug}.md"
+        body = _render_markdown(
+            en_text=merged_text, zh_text=zh_text, source=source,
+        )
+        new_path.write_text(body, encoding="utf-8")
+        if old_path and old_path != new_path:
+            try:
+                old_path.unlink()
+            except OSError:
+                pass
+
+        logger.info(
+            "merged continuation: old_id=%d -> new_id=%d "
+            "(len %d -> %d, source=%s)",
+            cand["id"], new_id, len(prev_text), len(merged_text), source,
+        )
+        return {
+            "path": new_path,
+            "is_new": False,
+            "zh_text": zh_text,
+            "fuzzy_match": False,
+            "was_continuation": True,
+            "merged_from_id": cand["id"],
+            "merged_len": len(merged_text),
+        }
+
+    return None
+
+
 def _fuzzy_find_existing(en_text: str, threshold: float) -> Path | None:
     """Scan the QUESTIONS_DIR for any .md whose English question is
     fuzzy-similar to en_text. Returns the existing path if a match is
