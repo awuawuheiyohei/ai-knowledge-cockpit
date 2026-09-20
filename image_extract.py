@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import re
 from dataclasses import dataclass, field
 
 import vl_config
@@ -32,6 +33,14 @@ logger = logging.getLogger("image_extract")
 
 # Image formats MiniMax-M3 / Anthropic SDK accepts as base64.
 _SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+# Server-side [TRUNCATED] fallback — see _maybe_flag_truncation() below.
+_TRUNCATED_RE = re.compile(r"\[truncated\]", re.IGNORECASE)
+# Anchor on whitespace (not `^`) so it works on OCR output that's all
+# on one line — CISSP screenshot OCR from MiniMax-M3 typically comes
+# back without newlines between question stem + options.
+_OPTION_LETTER_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]\s")
 
 
 @dataclass
@@ -181,6 +190,50 @@ def extract_text(image_path, usage: ExtractUsage | None = None) -> str:
         logger.info("image_extract: empty for %s", path)
         return ""
 
+    # Server-side [TRUNCATED] fallback: VL sometimes thinks a screenshot
+    # is complete when it actually ends mid-question (e.g., the options
+    # stop at C but D was cropped off). Detected by option letter
+    # sequence — if the highest visible letter is < D, the question is
+    # almost certainly missing later options, so flag it for the
+    # continuation merge logic downstream.
+    text = _maybe_flag_truncation(text)
+
     usage.chars_out = len(text)
     logger.info("image_extract: %s → %d chars", path, len(text))
+    return text
+
+
+def _maybe_flag_truncation(text: str) -> str:
+    """Append `[TRUNCATED]` if the extracted text looks incomplete but
+    the VL model didn't flag it.
+
+    Heuristic: extract option letters (A..E). If the highest visible
+    letter is below D (i.e., the last visible option is A, B, or C),
+    the question almost certainly has at least a D option that's been
+    cropped off — CISSP multiple choice is overwhelmingly 4 options
+    (A/B/C/D), and 3-option questions are vanishingly rare in this
+    corpus. Append the marker so the continuation merge logic in
+    `question_archive.append_continuation` can pick up the next
+    screenshot.
+
+    Skips when:
+      - VL already added the marker (idempotent)
+      - the question stem has NO option letters at all (looks like a
+        different document type; don't second-guess the VL output)
+    """
+    if not text:
+        return text
+    if _TRUNCATED_RE.search(text):
+        return text
+    letters = _OPTION_LETTER_RE.findall(text)
+    if not letters:
+        return text
+    max_letter = max(l.upper() for l in letters)
+    if max_letter < "D":
+        logger.info(
+            "image_extract: option-letter fallback → appending [TRUNCATED] "
+            "(max option = %s)",
+            max_letter,
+        )
+        return text.rstrip() + "\n[TRUNCATED]"
     return text

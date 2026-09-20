@@ -207,7 +207,7 @@ def _strip_word_punct(s: str) -> list[str]:
     return [w for w in out if w]
 
 
-_OPTION_LETTER_RE = re.compile(r"^\s*([A-Ea-e])[\.\)]")
+_OPTION_LETTER_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]")
 
 # Common short words that frequently appear at sentence/clause boundaries
 # in OCR text. We filter these out of the n=1 boundary alignment so a
@@ -238,6 +238,29 @@ def _is_option_letter_continuation(prev_text: str, new_text: str) -> bool:
     if expected > "E":
         return False
     return new_letter == expected
+
+
+def _extract_option_letters(text: str) -> set[str]:
+    """Extract the set of option letters (A..E) that appear at the start
+    of a line in `text`. Used to detect "missing trailing options" in
+    the prev screenshot and "options that complete the list" in new."""
+    return {m.group(1).upper() for m in _OPTION_LETTER_RE.finditer(text)}
+
+
+def _is_option_superset_continuation(prev_text: str, new_text: str) -> bool:
+    """Detect: prev has option letters {A,B,C} and new has {A,B,C,D} (or
+    similar strict superset). Strong continuation signal that works
+    even when the OCR noise prefix breaks suffix-prefix alignment at
+    the boundary.
+
+    Strict superset is required: equal sets would mean two different
+    questions with the same option letters (or a true duplicate).
+    """
+    prev_opts = _extract_option_letters(prev_text)
+    new_opts = _extract_option_letters(new_text)
+    if not prev_opts or not new_opts:
+        return False
+    return new_opts > prev_opts
 
 
 def _has_boundary_alignment(
@@ -282,9 +305,11 @@ def _is_continuation(prev_text: str, new_text: str) -> bool:
     cheap; false positives (silently merging two different questions)
     corrupt the archive, so we err on the side of refusing.
 
-    Signals (1 and 2 are mandatory; 3a OR 3b is also required):
+    Signals (1 and 2 are mandatory; one of 3a/3b/3c is also required):
       1. prev_text contains `[TRUNCATED]` (set by the OCR prompt when
-         it suspected the prior screenshot was cropped)
+         it suspected the prior screenshot was cropped, OR by
+         image_extract's option-letter fallback when options stop at
+         C or earlier)
       2. new_text's first non-space character does NOT look like the
          start of a brand-new question (digit / "Question N" / "Q.")
       3a. boundary alignment: prev's last n tokens == new's first n
@@ -293,6 +318,11 @@ def _is_continuation(prev_text: str, new_text: str) -> bool:
           continuation" (n=1, mid-word OCR cut).
       3b. option-letter continuation: prev's last visible line ends
           with option X (A..E) and new's first line starts with X+1.
+      3c. option-letter superset: new's option set is a strict
+          superset of prev's (e.g. prev={A,B,C}, new={A,B,C,D}).
+          Catches the "missing D option" case where the OCR noise
+          prefix breaks suffix-prefix alignment but the option list
+          clearly continues.
 
     Tokens are stripped of leading/trailing punctuation before
     comparison so "rotated." ≈ "rotated".
@@ -317,7 +347,77 @@ def _is_continuation(prev_text: str, new_text: str) -> bool:
         return True
     if _is_option_letter_continuation(prev_clean, new_text):
         return True
+    if _is_option_superset_continuation(prev_clean, new_text):
+        return True
     return False
+
+
+def _stitch_continuation(prev_clean: str, new_clean: str) -> str:
+    """Stitch two halves of a multi-screenshot question into one
+    deduped string. Used by append_continuation after we've decided
+    `new_clean` continues `prev_clean`.
+
+    Strategy:
+      1. Find the longest common substring between prev_clean and
+         new_clean (uses difflib.SequenceMatcher — character-level is
+         good enough and avoids tokenization drift across the two
+         OCR passes).
+      2. Compare case-insensitively because the prev text was
+         normalized to lowercase when stored in SQLite, while the new
+         text comes straight from the OCR (mixed case). Plain
+         SequenceMatcher would miss the overlap and fall through to
+         plain concat — leaving OCR noise prefixes in the result.
+      3. If the overlap is substantial (>= 30 chars) and centered in
+         the middle of both halves, stitch as
+            prev[:overlap_end_in_prev] + new[overlap_end_in_new:]
+         so the shared middle is kept exactly once.
+      4. Otherwise (no overlap, or the overlap is a single short word
+         that could just be coincidence), fall back to plain concat.
+
+    Whitespace is normalized (single spaces) so the merged file stays
+    readable.
+    """
+    from difflib import SequenceMatcher
+    prev = prev_clean.strip()
+    new = new_clean.strip()
+    if not prev:
+        return new
+    if not new:
+        return prev
+
+    # Case-insensitive LCS: prev is normalized lowercase (DB storage),
+    # new is whatever case OCR returned. SequenceMatcher's first arg
+    # is `isjunk` (filters out junk chars), not a compare transform —
+    # so we lowercase both sides explicitly and slice back into the
+    # original-case strings using the matched offsets.
+    prev_lower = prev.lower()
+    new_lower = new.lower()
+    sm = SequenceMatcher(None, prev_lower, new_lower, autojunk=False)
+    match = sm.find_longest_match(0, len(prev_lower), 0, len(new_lower))
+    # Only stitch if the overlap is substantial. 30 chars is roughly
+    # "the warehouse for long-term storage" — long enough that a pure
+    # coincidence between two unrelated CISSP questions is unlikely.
+    if match.size < 30:
+        return f"{prev} {new}"
+
+    a_start, a_end = match.a, match.a + match.size
+    b_start, b_end = match.b, match.b + match.size
+
+    # Refuse to stitch if the overlap doesn't sit "in the middle" of
+    # both halves — i.e., one side is essentially fully contained in
+    # the other. That's a duplicate, not a continuation; let
+    # downstream dedup handle it instead of producing a weird
+    # half-overlap string.
+    if a_start == 0 and b_end == len(new):
+        # new fully contains prev's tail; new is the more complete version.
+        # Drop prev entirely (it's a subset).
+        return new
+    if a_start == 0 or b_end == len(new):
+        return f"{prev} {new}"
+
+    stitched = prev[:a_end] + new[b_end:]
+    # Normalize whitespace — SequenceMatcher can leave odd boundaries.
+    return " ".join(stitched.split())
 
 
 def append_continuation(
@@ -376,9 +476,21 @@ def append_continuation(
         if not _is_continuation(prev_text, en_text):
             continue
 
-        # Merge: strip the [TRUNCATED] marker, append new text.
+        # Merge: strip the [TRUNCATED] marker, then either concatenate
+        # or stitch by longest-common-substring.
+        #
+        # When the boundary alignment (signal 3a) fired, prev's last
+        # few tokens appear at new's start, so simple concat works and
+        # produces ~no duplication.
+        #
+        # When only the option-superset signal (3c) fired (typical when
+        # new has an OCR noise prefix), prev's tail and new's head don't
+        # align at the boundary but they share a big middle run (the
+        # question stem often appears in both screenshots). In that
+        # case simple concat would duplicate the stem — stitch by LCS
+        # to keep the merged text clean.
         prev_clean = _TRUNCATED_RE.sub(" ", prev_text).strip()
-        merged_text = (prev_clean + " " + en_text.strip()).strip()
+        merged_text = _stitch_continuation(prev_clean, en_text.strip())
 
         # Re-translate the FULL merged text so the Chinese translation
         # is consistent with the new English (cheap: one LLM call).
