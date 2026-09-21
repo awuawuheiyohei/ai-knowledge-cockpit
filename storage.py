@@ -782,20 +782,40 @@ def replace_archived_text(
 
 def find_recent_archives(
     source: str,
-    seconds: int = 180,
+    seconds: int = 3600,
     requires_truncated: bool = False,
+    requires_incomplete: bool = False,
     max_count: int = 5,
 ) -> list[dict]:
     """Return recent archives from this source (within `seconds`),
-    newest first. Optionally filtered to those whose question_text
-    contains the literal `[TRUNCATED]` marker. Used by the
-    continuation-detection logic.
+    newest first. Optionally filtered:
+      - requires_truncated: only those whose question_text contains
+        the literal `[TRUNCATED]` marker (OCR or option-letter
+        fallback confirmed this screenshot was cropped).
+      - requires_incomplete: superset of requires_truncated — also
+        returns candidates that don't have the explicit marker but
+        look structurally incomplete (no option letters detected, or
+        options stop at A/B/C without D/E). Used to allow cross-session
+        re-attaches where the original OCR didn't flag truncation
+        (e.g., very early archives saved before the fallback existed).
     """
     from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
     conn = get_conn()
     try:
-        if requires_truncated:
+        if requires_incomplete:
+            # Apply requires_incomplete filter post-fetch because the
+            # "looks incomplete" check is Python-side (regex on text).
+            # This costs a few extra rows over the wire but keeps the
+            # SQL simple.
+            rows = conn.execute(
+                "SELECT id, question_text, domain, source, created_at "
+                "FROM archived_questions "
+                "WHERE source = ? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (source, cutoff, max_count * 4),
+            ).fetchall()
+        elif requires_truncated:
             rows = conn.execute(
                 "SELECT id, question_text, domain, source, created_at "
                 "FROM archived_questions "
@@ -812,6 +832,30 @@ def find_recent_archives(
                 "ORDER BY created_at DESC LIMIT ?",
                 (source, cutoff, max_count),
             ).fetchall()
+
+        if requires_incomplete:
+            import re as _re
+            truncated_re = _re.compile(r"\[truncated\]", _re.IGNORECASE)
+            strong_re = _re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]")
+            weak_re = _re.compile(r"(?:^|\s)([A-Ea-e])\s*$")
+            kept = []
+            for r in rows:
+                txt = r["question_text"]
+                if truncated_re.search(txt):
+                    kept.append(r)
+                    continue
+                # No explicit marker — check if it looks structurally
+                # incomplete (no options, or options stop at A/B/C).
+                strong = [m.group(1).upper() for m in strong_re.finditer(txt)]
+                if strong:
+                    letters = set(strong)
+                else:
+                    letters = {m.group(1).upper() for m in weak_re.finditer(txt)}
+                if not letters or max(letters) < "D":
+                    kept.append(r)
+                if len(kept) >= max_count:
+                    break
+            return [dict(r) for r in kept]
         return [dict(r) for r in rows]
     finally:
         conn.close()

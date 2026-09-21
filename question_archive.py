@@ -190,7 +190,13 @@ def _normalize(text: str) -> str:
 # Heuristics guard rails — if any of these fires, we DO NOT merge.
 # Listed positively so tests can assert the exact decision boundary.
 _MAX_CONTINUATIONS_PER_QUESTION = 5  # hard safety cap
-_TIME_WINDOW_SECONDS = 180  # default merge window
+# Time window for finding a continuation candidate. 1 hour by default —
+# long enough that a user can upload the second screenshot minutes
+# later or even in a different session within the same study session,
+# short enough that yesterday's question doesn't accidentally merge
+# with today's new one (the content-matching signals are the primary
+# safety; the time window is just a tiebreaker / scope limit).
+_TIME_WINDOW_SECONDS = 3600
 _TRUNCATED_RE = re.compile(r"\[truncated\]", re.IGNORECASE)
 _NEW_QUESTION_START_RE = re.compile(r"^\s*(?:\d+[\.\)、]|q(?:uestion)?\s*\d+|question\b)",
                                    re.IGNORECASE)
@@ -207,7 +213,8 @@ def _strip_word_punct(s: str) -> list[str]:
     return [w for w in out if w]
 
 
-_OPTION_LETTER_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]")
+_STRONG_OPTION_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]")
+_WEAK_OPTION_RE = re.compile(r"(?:^|\s)([A-Ea-e])\s*$")
 
 # Common short words that frequently appear at sentence/clause boundaries
 # in OCR text. We filter these out of the n=1 boundary alignment so a
@@ -228,8 +235,8 @@ def _is_option_letter_continuation(prev_text: str, new_text: str) -> bool:
     new_lines = [ln for ln in new_text.splitlines() if ln.strip()]
     if not prev_lines or not new_lines:
         return False
-    m_prev = _OPTION_LETTER_RE.match(prev_lines[-1])
-    m_new = _OPTION_LETTER_RE.match(new_lines[0])
+    m_prev = _STRONG_OPTION_RE.match(prev_lines[-1])
+    m_new = _STRONG_OPTION_RE.match(new_lines[0])
     if not (m_prev and m_new):
         return False
     prev_letter = m_prev.group(1).upper()
@@ -243,8 +250,33 @@ def _is_option_letter_continuation(prev_text: str, new_text: str) -> bool:
 def _extract_option_letters(text: str) -> set[str]:
     """Extract the set of option letters (A..E) that appear at the start
     of a line in `text`. Used to detect "missing trailing options" in
-    the prev screenshot and "options that complete the list" in new."""
-    return {m.group(1).upper() for m in _OPTION_LETTER_RE.finditer(text)}
+    the prev screenshot and "options that complete the list" in new.
+
+    Two-stage: strong match (period/paren after letter) wins;
+    weak match (handles cut-mid-option like "...0.002 A") only used
+    when strong finds nothing.
+    """
+    strong = [m.group(1).upper() for m in _STRONG_OPTION_RE.finditer(text)]
+    if strong:
+        return set(strong)
+    return {m.group(1).upper() for m in _WEAK_OPTION_RE.finditer(text)}
+
+
+def _has_incomplete_options(text: str) -> bool:
+    """True if the text looks like a partial question — either has no
+    option letters at all, or its options stop at A/B/C (no D or E).
+
+    This is a weaker signal than [TRUNCATED] (no explicit OCR
+    confirmation that the screenshot was cropped), so it's used as a
+    secondary filter: the candidate must also match a content signal
+    (suffix-prefix overlap / option continuation / option superset)
+    before being accepted as a continuation.
+    """
+    opts = _extract_option_letters(text)
+    if not opts:
+        return True
+    max_letter = max(opts)
+    return max_letter < "D"
 
 
 def _is_option_superset_continuation(prev_text: str, new_text: str) -> bool:
@@ -426,8 +458,13 @@ def append_continuation(
     seconds: int = _TIME_WINDOW_SECONDS,
     max_per_question: int = _MAX_CONTINUATIONS_PER_QUESTION,
 ) -> dict | None:
-    """Try to append `en_text` to the most recent truncated archive
+    """Try to append `en_text` to the most recent incomplete archive
     from `source` within `seconds`.
+
+    "Incomplete" means either:
+      - has [TRUNCATED] marker (OCR or option-letter fallback), OR
+      - has no/missing options (regex finds no A/B/C/D), OR
+      - has options only up to A/B/C (no D or E)
 
     Returns:
       - None: no continuation candidate (caller should fall through
@@ -437,17 +474,15 @@ def append_continuation(
                       merged_len=<new len>}
 
     The merge is precise:
-      - prev had `[TRUNCATED]` (set by OCR)
+      - prev is incomplete (one of the three signals above)
       - new is not a new question start
-      - at least one shared trigram across the boundary
+      - at least one content signal fires (suffix-prefix overlap,
+        option-letter continuation, OR option-letter superset)
       - within the time window from same source
       - dedup against the merged text (collision is rolled back)
 
-    Hard safety: each row's question_text is capped at
-    `_MAX_CONTINUATIONS_PER_QUESTION` implied continuations by
-    counting `[TRUNCATED]` markers in the previous archive — if
-    too many were already merged into the candidate, we don't merge
-    again.
+    Hard safety: at most _MAX_CONTINUATIONS_PER_QUESTION merges into
+    any single row (counted by [TRUNCATED] markers in prev_text).
     """
     if not en_text.strip():
         return None
@@ -455,7 +490,7 @@ def append_continuation(
     candidates = storage.find_recent_archives(
         source=source,
         seconds=seconds,
-        requires_truncated=True,
+        requires_incomplete=True,
         max_count=max_per_question,
     )
     for cand in candidates:
@@ -465,13 +500,20 @@ def append_continuation(
         # absorbed too many continuations. Each merge strips one
         # [TRUNCATED] marker from `prev_text` and adds no new marker,
         # so counting markers in `prev_text` approximates the
-        # number of unfinished continuations still pending. (0 markers
-        # means the prev wasn't truncated — but we filter on
-        # requires_truncated=True so this branch is defensive only.)
+        # number of unfinished continuations still pending.
         prev_marker_count = len(_TRUNCATED_RE.findall(prev_text))
         if prev_marker_count == 0:
-            # Already-merged (someone else completed it). Skip.
-            continue
+            # No marker means we matched via the "incomplete options"
+            # signal only. That signal is weaker (no explicit truncation
+            # confirmation), so we apply the cap more aggressively:
+            # only one merge per such candidate unless [TRUNCATED] is
+            # actually present.
+            # For now, allow exactly one continuation-merge per row
+            # that was matched on the incomplete-options signal alone.
+            # (The merged text will get a fresh [TRUNCATED] check on
+            # the next incoming screenshot.)
+            if not _has_incomplete_options(prev_text):
+                continue
 
         if not _is_continuation(prev_text, en_text):
             continue

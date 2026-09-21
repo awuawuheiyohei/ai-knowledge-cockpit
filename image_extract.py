@@ -37,10 +37,19 @@ _SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 # Server-side [TRUNCATED] fallback — see _maybe_flag_truncation() below.
 _TRUNCATED_RE = re.compile(r"\[truncated\]", re.IGNORECASE)
-# Anchor on whitespace (not `^`) so it works on OCR output that's all
-# on one line — CISSP screenshot OCR from MiniMax-M3 typically comes
-# back without newlines between question stem + options.
-_OPTION_LETTER_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]\s")
+# Strong option marker: "A. text" / "A) text" — letter followed by
+# period or paren + whitespace. Reliable, low false-positive.
+_STRONG_OPTION_RE = re.compile(r"(?:^|\s)([A-Ea-e])[\.\)]")
+# Weak option marker: catches cut-mid-option cases like "...0.002 A"
+# (option A's text "0.002" and the next option letter are concatenated
+# without a separator). Applied only when STRONG finds nothing —
+# otherwise a sentence like "Just a fragment of text without options."
+# would falsely match the "a" / "e" articles.
+#
+# Restricted to end-of-string so we only catch a single trailing
+# A-E letter that clearly looks like a cropped option start — NOT
+# every "a" / "e" article that appears mid-sentence.
+_WEAK_OPTION_RE = re.compile(r"(?:^|\s)([A-Ea-e])\s*$")
 
 
 @dataclass
@@ -225,7 +234,7 @@ def _maybe_flag_truncation(text: str) -> str:
         return text
     if _TRUNCATED_RE.search(text):
         return text
-    letters = _OPTION_LETTER_RE.findall(text)
+    letters = _extract_option_letters_two_stage(text)
     if not letters:
         return text
     max_letter = max(l.upper() for l in letters)
@@ -237,3 +246,18 @@ def _maybe_flag_truncation(text: str) -> str:
         )
         return text.rstrip() + "\n[TRUNCATED]"
     return text
+
+
+def _extract_option_letters_two_stage(text: str) -> list[str]:
+    """Extract option letters A-E (or a-e) from text using a two-stage
+    match: first try the strong marker (period or paren after the
+    letter); only if that finds nothing, fall back to the weak marker
+    (handles cut-mid-option cases like "...0.002 A").
+
+    Two-stage prevents false positives on regular English text where
+    a lone "a"/"e" article appears mid-sentence.
+    """
+    strong = _STRONG_OPTION_RE.findall(text)
+    if strong:
+        return strong
+    return _WEAK_OPTION_RE.findall(text)

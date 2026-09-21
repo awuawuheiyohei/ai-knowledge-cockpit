@@ -152,6 +152,27 @@ class TestImageExtractFallback(unittest.TestCase):
         out = _maybe_flag_truncation(text)
         self.assertNotIn("[TRUNCATED]", out)
 
+    def test_appends_marker_when_option_letter_cut_at_end(self):
+        """User scenario 2026-09-21: OCR cut between option A's TEXT
+        and the option letter itself ("...0.002 A"). Strong regex
+        needs "." after the letter and finds nothing. Weak regex
+        (single trailing A-E letter) catches it and flags truncation."""
+        from image_extract import _maybe_flag_truncation
+        text = (
+            "Question 4/5 What is the annualized rate of occurrence? 0.002 A"
+        )
+        out = _maybe_flag_truncation(text)
+        self.assertIn("[TRUNCATED]", out)
+
+    def test_weak_regex_does_not_match_mid_sentence_articles(self):
+        """Weak regex restricted to end-of-string so a sentence like
+        'Just a fragment of text without options.' doesn't falsely
+        match the 'a' / 'e' articles."""
+        from image_extract import _extract_option_letters_two_stage
+        text = "Just a fragment of text without options."
+        letters = _extract_option_letters_two_stage(text)
+        self.assertEqual(letters, [])
+
 
 class TestStitchContinuation(unittest.TestCase):
     """LCS-based merge — dedups the question stem when prev and new
